@@ -38,7 +38,10 @@ async def test_embeddings_batch_all_inputs_in_one_request():
 
     assert result == [[1.0, 2.0], [3.0, 4.0]]
     assert len(client.calls) == 1
-    assert client.calls[0][1] == {"model": "nomic-embed-text", "input": ["first", "second"]}
+    assert client.calls[0][1] == {
+        "model": "nomic-embed-text",
+        "input": ["first", "second"],
+    }
     await backend.close()
 
 

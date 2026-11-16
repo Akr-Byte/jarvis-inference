@@ -483,7 +483,9 @@ async def test_sweep_stale_leaves_running_requests(scheduler: Scheduler) -> None
 
 
 @pytest.mark.asyncio
-async def test_release_slot_after_sweep_does_not_over_release(scheduler: Scheduler) -> None:
+async def test_release_slot_after_sweep_does_not_over_release(
+    scheduler: Scheduler,
+) -> None:
     """GW-15: the abandoned handler's late finally must not double-release."""
     stale_age = 1.5 * max(settings.chat_timeout_seconds, settings.stream_timeout_seconds) + 10
     await scheduler._semaphore.acquire()
@@ -496,7 +498,9 @@ async def test_release_slot_after_sweep_does_not_over_release(scheduler: Schedul
 
 
 @pytest.mark.asyncio
-async def test_sweep_keeps_active_model_gauge_for_live_requests(scheduler: Scheduler) -> None:
+async def test_sweep_keeps_active_model_gauge_for_live_requests(
+    scheduler: Scheduler,
+) -> None:
     """GW-15: sweeping one stale entry must not stomp a live request's model gauge."""
     scheduler._semaphore = asyncio.Semaphore(2)
     stale_age = 1.5 * max(settings.chat_timeout_seconds, settings.stream_timeout_seconds) + 10

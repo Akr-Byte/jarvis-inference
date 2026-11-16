@@ -49,9 +49,7 @@ class CircuitBreaker:
                 # A single trial request is already probing the backend
                 # (GW-12); concurrent callers must not flood it while it is
                 # half-open.
-                raise CircuitOpenError(
-                    "backend circuit is open (half-open trial in progress)"
-                )
+                raise CircuitOpenError("backend circuit is open (half-open trial in progress)")
         state.half_open = True
         state.trial_started_at = time.monotonic()
 

@@ -210,7 +210,10 @@ def test_stream_backend_error_is_emitted_as_sse_event(monkeypatch) -> None:
         return lease
 
     async def failing_stream(
-        payload: dict, request_id: str | None = None, *, lease: StreamLease | None = None
+        payload: dict,
+        request_id: str | None = None,
+        *,
+        lease: StreamLease | None = None,
     ):
         async def events():
             raise InferenceError("MODEL_TIMEOUT", "generation timed out", True, 504)
