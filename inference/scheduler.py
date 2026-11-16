@@ -54,10 +54,7 @@ def _check_context_window(payload: dict[str, Any]) -> None:
     (escaped characters count) for admission purposes.
     """
     requested_context = payload.get("num_ctx")
-    if (
-        requested_context is not None
-        and int(requested_context) > settings.max_context_length
-    ):
+    if requested_context is not None and int(requested_context) > settings.max_context_length:
         raise InferenceError(
             "CONTEXT_LIMIT_EXCEEDED",
             f"num_ctx cannot exceed the configured limit of {settings.max_context_length}",
@@ -65,9 +62,7 @@ def _check_context_window(payload: dict[str, Any]) -> None:
             400,
         )
     effective = (
-        int(requested_context)
-        if requested_context is not None
-        else settings.max_context_length
+        int(requested_context) if requested_context is not None else settings.max_context_length
     )
     messages = payload.get("messages", [])
     estimated = (len(json.dumps(messages).encode("utf-8")) + 2) // 3
@@ -120,9 +115,7 @@ class Scheduler:
         try:
             self._queue.put_nowait(object())
         except asyncio.QueueFull as exc:
-            raise InferenceError(
-                "QUEUE_FULL", "Inference queue is full", True, 429
-            ) from exc
+            raise InferenceError("QUEUE_FULL", "Inference queue is full", True, 429) from exc
         QUEUE.set(self._queue.qsize())
 
     def _dequeue(self) -> None:
@@ -226,9 +219,7 @@ class Scheduler:
         """Start the background loop that periodically sweeps stale slots."""
         if self._sweeper_task is not None and not self._sweeper_task.done():
             return
-        self._sweeper_task = asyncio.create_task(
-            self._sweep_loop(), name="scheduler-sweeper"
-        )
+        self._sweeper_task = asyncio.create_task(self._sweep_loop(), name="scheduler-sweeper")
 
     async def _sweep_loop(self) -> None:
         while True:
@@ -366,9 +357,7 @@ class Scheduler:
             if queued:
                 await self._release()
 
-    async def chat(
-        self, payload: dict[str, Any], request_id: str | None = None
-    ) -> dict[str, Any]:
+    async def chat(self, payload: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
         model = str(payload.get("model") or settings.default_model)
         model_manager.validate_chat(model)
         _check_context_window(payload)
@@ -400,9 +389,7 @@ class Scheduler:
                     self._record_circuit()
                     model_manager.record_loaded(model)
                     usage = result.get("usage", {})
-                    TOKENS.labels(model=model, kind="prompt").inc(
-                        usage.get("prompt_tokens", 0)
-                    )
+                    TOKENS.labels(model=model, kind="prompt").inc(usage.get("prompt_tokens", 0))
                     TOKENS.labels(model=model, kind="completion").inc(
                         usage.get("completion_tokens", 0)
                     )
@@ -530,13 +517,9 @@ class Scheduler:
                             if load:
                                 MODEL_LOAD.labels(model=model).observe(load)
                             if generation:
-                                GENERATION_DURATION.labels(model=model).observe(
-                                    generation
-                                )
+                                GENERATION_DURATION.labels(model=model).observe(generation)
                             if completion:
-                                TOKENS.labels(model=model, kind="completion").inc(
-                                    completion
-                                )
+                                TOKENS.labels(model=model, kind="completion").inc(completion)
                                 if generation:
                                     TOKENS_PER_SECOND.labels(model=model).observe(
                                         completion / generation

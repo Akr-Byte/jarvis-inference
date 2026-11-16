@@ -126,9 +126,7 @@ async def test_queue_full_returns_retryable_error(scheduler: Scheduler) -> None:
 
 
 @pytest.mark.asyncio
-async def test_resource_pressure_is_normalized(
-    monkeypatch, scheduler: Scheduler
-) -> None:
+async def test_resource_pressure_is_normalized(monkeypatch, scheduler: Scheduler) -> None:
     scheduler._ollama = FakeBackend()
     monkeypatch.setattr(
         "inference.scheduler.admit_request",
@@ -174,9 +172,7 @@ async def test_cancellation_releases_queue_and_active_slot(
 
 
 @pytest.mark.asyncio
-async def test_embedding_resource_pressure_is_counted(
-    monkeypatch, scheduler: Scheduler
-) -> None:
+async def test_embedding_resource_pressure_is_counted(monkeypatch, scheduler: Scheduler) -> None:
     scheduler._ollama = FakeBackend()
     monkeypatch.setattr(
         "inference.scheduler.admit_request",
@@ -222,9 +218,7 @@ async def test_embeddings_success_records_result(scheduler: Scheduler) -> None:
 
 
 @pytest.mark.asyncio
-async def test_embedding_timeout_is_normalized(
-    monkeypatch, scheduler: Scheduler
-) -> None:
+async def test_embedding_timeout_is_normalized(monkeypatch, scheduler: Scheduler) -> None:
     class SlowEmbeddingBackend(FakeBackend):
         async def embeddings(self, model: str, inputs: list[str]) -> list[list[float]]:
             await asyncio.sleep(0.05)
@@ -290,9 +284,7 @@ async def test_model_preparation_waits_until_slot_is_acquired(
     monkeypatch.setattr(scheduler, "_prepare", blocked_prepare)
     first = asyncio.create_task(scheduler.chat({"model": "qwen3:1.7b", "messages": []}))
     await entered_prepare.wait()
-    second = asyncio.create_task(
-        scheduler.chat({"model": "qwen3:1.7b", "messages": []})
-    )
+    second = asyncio.create_task(scheduler.chat({"model": "qwen3:1.7b", "messages": []}))
 
     with pytest.raises(InferenceError) as caught:
         await second
@@ -422,9 +414,7 @@ async def test_stream_without_done_event_is_a_failure(scheduler: Scheduler) -> N
 
 
 @pytest.mark.asyncio
-async def test_active_request_age_tracks_oldest_entry(
-    scheduler: Scheduler, monkeypatch
-) -> None:
+async def test_active_request_age_tracks_oldest_entry(scheduler: Scheduler, monkeypatch) -> None:
     """GW-20: admitting a newer request must not stomp the oldest-age gauge."""
     from inference.metrics import ACTIVE_REQUEST_AGE
     from inference.scheduler import InferenceError  # noqa: F401
@@ -466,9 +456,7 @@ def _active_entry(request_id: str, age_seconds: float) -> dict:
 @pytest.mark.asyncio
 async def test_sweep_stale_reclaims_abandoned_slot(scheduler: Scheduler) -> None:
     """GW-15: a slot held longer than 1.5x the max timeout belongs to an abandoned stream."""
-    stale_age = (
-        1.5 * max(settings.chat_timeout_seconds, settings.stream_timeout_seconds) + 10
-    )
+    stale_age = 1.5 * max(settings.chat_timeout_seconds, settings.stream_timeout_seconds) + 10
     await scheduler._semaphore.acquire()
     scheduler._active["inf-1"] = _active_entry("inf-1", stale_age)
     ACTIVE_MODEL.labels(model="qwen3:1.7b").set(1)
@@ -499,9 +487,7 @@ async def test_release_slot_after_sweep_does_not_over_release(
     scheduler: Scheduler,
 ) -> None:
     """GW-15: the abandoned handler's late finally must not double-release."""
-    stale_age = (
-        1.5 * max(settings.chat_timeout_seconds, settings.stream_timeout_seconds) + 10
-    )
+    stale_age = 1.5 * max(settings.chat_timeout_seconds, settings.stream_timeout_seconds) + 10
     await scheduler._semaphore.acquire()
     scheduler._active["inf-1"] = _active_entry("inf-1", stale_age)
 
@@ -517,9 +503,7 @@ async def test_sweep_keeps_active_model_gauge_for_live_requests(
 ) -> None:
     """GW-15: sweeping one stale entry must not stomp a live request's model gauge."""
     scheduler._semaphore = asyncio.Semaphore(2)
-    stale_age = (
-        1.5 * max(settings.chat_timeout_seconds, settings.stream_timeout_seconds) + 10
-    )
+    stale_age = 1.5 * max(settings.chat_timeout_seconds, settings.stream_timeout_seconds) + 10
     await scheduler._semaphore.acquire()
     await scheduler._semaphore.acquire()
     scheduler._active["inf-1"] = _active_entry("inf-1", stale_age)

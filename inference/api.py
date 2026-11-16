@@ -40,9 +40,7 @@ UNSUPPORTED_CHAT_PARAMS = frozenset(
 )
 
 
-def _error_headers(
-    request_id: str, exc: InferenceError | None = None
-) -> dict[str, str]:
+def _error_headers(request_id: str, exc: InferenceError | None = None) -> dict[str, str]:
     headers = {"X-Request-ID": request_id}
     if exc is not None:
         if exc.code == "QUEUE_TIMEOUT":
@@ -135,9 +133,7 @@ async def embeddings(
             "data": [
                 {
                     "object": "embedding",
-                    "embedding": _encode_embedding(
-                        vector, payload.encoding_format or "float"
-                    ),
+                    "embedding": _encode_embedding(vector, payload.encoding_format or "float"),
                     "index": index,
                 }
                 for index, vector in enumerate(vectors)
@@ -231,8 +227,7 @@ async def chat(
                 "error": {
                     "code": "UNSUPPORTED_PARAMETER",
                     "message": (
-                        "parameters not supported by this gateway: "
-                        + ", ".join(unsupported)
+                        "parameters not supported by this gateway: " + ", ".join(unsupported)
                     ),
                     "retryable": False,
                     "request_id": request_id,
@@ -278,9 +273,7 @@ async def _stream(
     # stream_options.include_usage, the usage object ships in a final
     # usage-only chunk with empty choices — not inside the content chunk.
     stream_options = body.get("stream_options")
-    include_usage = bool(
-        isinstance(stream_options, dict) and stream_options.get("include_usage")
-    )
+    include_usage = bool(isinstance(stream_options, dict) and stream_options.get("include_usage"))
     try:
         stream = await scheduler.stream(body, request_id=request_id, lease=lease)
         async for line in stream:
@@ -311,14 +304,10 @@ async def _stream(
                             "id": f"{request_id}-call-{position}",
                             "type": "function",
                             "function": {
-                                "name": str(
-                                    (call.get("function") or {}).get("name") or ""
-                                ),
+                                "name": str((call.get("function") or {}).get("name") or ""),
                                 "arguments": (
                                     json.dumps(
-                                        (call.get("function") or {}).get(
-                                            "arguments", {}
-                                        ),
+                                        (call.get("function") or {}).get("arguments", {}),
                                         ensure_ascii=False,
                                     )
                                     if not isinstance(

@@ -51,9 +51,7 @@ async def lifespan(_: FastAPI):
     scheduler.start_sweeper()
     yield
     try:
-        await asyncio.wait_for(
-            scheduler.close(), timeout=settings.shutdown_timeout_seconds
-        )
+        await asyncio.wait_for(scheduler.close(), timeout=settings.shutdown_timeout_seconds)
     except TimeoutError:
         pass
 

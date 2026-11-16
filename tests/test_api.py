@@ -206,9 +206,7 @@ def test_stream_queue_timeout_returns_retry_after(monkeypatch) -> None:
 def test_stream_backend_error_is_emitted_as_sse_event(monkeypatch) -> None:
     lease = StreamLease(model="qwen3:1.7b", request_id="stream-request")
 
-    async def prepared_stream(
-        payload: dict, request_id: str | None = None
-    ) -> StreamLease:
+    async def prepared_stream(payload: dict, request_id: str | None = None) -> StreamLease:
         return lease
 
     async def failing_stream(
@@ -262,9 +260,7 @@ def test_unsupported_parameters_are_rejected() -> None:
 def _prepare_stream_stub(monkeypatch, events: list[str]) -> StreamLease:
     lease = StreamLease(model="qwen3:1.7b", request_id="stream-request")
 
-    async def prepared_stream(
-        payload: dict, request_id: str | None = None
-    ) -> StreamLease:
+    async def prepared_stream(payload: dict, request_id: str | None = None) -> StreamLease:
         return lease
 
     async def fake_stream(payload: dict, request_id: str | None = None, *, lease=None):
