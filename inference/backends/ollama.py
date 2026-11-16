@@ -24,14 +24,18 @@ class OllamaBackend:
             max_keepalive_connections=1,
             keepalive_expiry=30.0,
         )
-        self._client = httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=False)
+        self._client = httpx.AsyncClient(
+            timeout=timeout, limits=limits, trust_env=False
+        )
 
     async def close(self) -> None:
         await self._client.aclose()
 
     async def health(self) -> bool:
         try:
-            response = await self._client.get(f"{settings.ollama_url}/api/tags", timeout=3)
+            response = await self._client.get(
+                f"{settings.ollama_url}/api/tags", timeout=3
+            )
             response.raise_for_status()
             return True
         except httpx.HTTPError:
@@ -71,7 +75,9 @@ class OllamaBackend:
             )
             response.raise_for_status()
             embeddings = response.json().get("embeddings") or []
-            if len(embeddings) != len(inputs) or any(not vector for vector in embeddings):
+            if len(embeddings) != len(inputs) or any(
+                not vector for vector in embeddings
+            ):
                 raise InferenceError(
                     "BACKEND_ERROR",
                     "Ollama returned an incomplete embedding batch",
@@ -104,7 +110,9 @@ class OllamaBackend:
             )
             response.raise_for_status()
         except httpx.TimeoutException as exc:
-            raise InferenceError("MODEL_TIMEOUT", "Inference request timed out", True, 504) from exc
+            raise InferenceError(
+                "MODEL_TIMEOUT", "Inference request timed out", True, 504
+            ) from exc
         except httpx.HTTPStatusError as exc:
             retryable = exc.response.status_code >= 500
             raise InferenceError(
@@ -129,7 +137,9 @@ class OllamaBackend:
                     if line:
                         yield line
         except httpx.TimeoutException as exc:
-            raise InferenceError("MODEL_TIMEOUT", "Inference request timed out", True, 504) from exc
+            raise InferenceError(
+                "MODEL_TIMEOUT", "Inference request timed out", True, 504
+            ) from exc
         except httpx.HTTPStatusError as exc:
             retryable = exc.response.status_code >= 500
             raise InferenceError(
@@ -164,7 +174,9 @@ class OllamaBackend:
             # A falsy keep_alive (e.g. 0 = unload immediately) must not fall
             # back to the configured residency default (GW-19).
             "keep_alive": (
-                payload["keep_alive"] if "keep_alive" in payload else settings.ollama_keep_alive
+                payload["keep_alive"]
+                if "keep_alive" in payload
+                else settings.ollama_keep_alive
             ),
             "options": options,
         }
@@ -172,7 +184,9 @@ class OllamaBackend:
         # (GW-10): only send the flag to thinking-capable models.
         if supports_thinking(model):
             think = payload.get("think")
-            body["think"] = bool(think) if think is not None else settings.ollama_think_default
+            body["think"] = (
+                bool(think) if think is not None else settings.ollama_think_default
+            )
         if payload.get("stop") is not None:
             options["stop"] = payload["stop"]
         if payload.get("tools") is not None:

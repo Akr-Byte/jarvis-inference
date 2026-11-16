@@ -13,14 +13,18 @@ def _float(name: str, default: float) -> float:
 
 
 def _csv(name: str, default: str) -> tuple[str, ...]:
-    return tuple(item.strip() for item in os.getenv(name, default).split(",") if item.strip())
+    return tuple(
+        item.strip() for item in os.getenv(name, default).split(",") if item.strip()
+    )
 
 
 @dataclass
 class Settings:
     host: str = field(default_factory=lambda: os.getenv("INFERENCE_HOST", "0.0.0.0"))
     port: int = field(default_factory=lambda: _int("INFERENCE_PORT", 8080))
-    api_key: str = field(default_factory=lambda: os.getenv("INFERENCE_API_KEY", "").strip())
+    api_key: str = field(
+        default_factory=lambda: os.getenv("INFERENCE_API_KEY", "").strip()
+    )
     allow_insecure_no_auth: bool = field(
         default_factory=lambda: (
             os.getenv("INFERENCE_ALLOW_INSECURE_NO_AUTH", "false").strip().lower()
@@ -31,11 +35,15 @@ class Settings:
         default_factory=lambda: max(1, _int("MAX_CONCURRENT_REQUESTS", 1))
     )
     # asyncio.Queue treats maxsize=0 as "unbounded" (GW-1), so clamp to 1+.
-    max_queue_size: int = field(default_factory=lambda: max(1, _int("MAX_QUEUE_SIZE", 8)))
+    max_queue_size: int = field(
+        default_factory=lambda: max(1, _int("MAX_QUEUE_SIZE", 8))
+    )
     max_request_body_mib: float = field(
         default_factory=lambda: max(0.05, _float("MAX_REQUEST_BODY_MIB", 8.0))
     )
-    max_loaded_models: int = field(default_factory=lambda: max(1, _int("MAX_LOADED_MODELS", 1)))
+    max_loaded_models: int = field(
+        default_factory=lambda: max(1, _int("MAX_LOADED_MODELS", 1))
+    )
     memory_budget_gb: float = field(
         default_factory=lambda: max(0.5, _float("MEMORY_BUDGET_GB", 10.0))
     )
@@ -75,21 +83,30 @@ class Settings:
     circuit_recovery_seconds: float = field(
         default_factory=lambda: max(1.0, _float("CIRCUIT_RECOVERY_SECONDS", 15.0))
     )
-    default_model: str = field(default_factory=lambda: os.getenv("DEFAULT_MODEL", "qwen3:1.7b"))
+    default_model: str = field(
+        default_factory=lambda: os.getenv("DEFAULT_MODEL", "qwen3:1.7b")
+    )
     embedding_model: str = field(
         default_factory=lambda: os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
     )
     ollama_url: str = field(
-        default_factory=lambda: os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
+        default_factory=lambda: os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip(
+            "/"
+        )
     )
-    llamacpp_url: str = field(default_factory=lambda: os.getenv("LLAMACPP_URL", "").rstrip("/"))
-    ollama_keep_alive: str = field(default_factory=lambda: os.getenv("OLLAMA_KEEP_ALIVE", "30m"))
+    llamacpp_url: str = field(
+        default_factory=lambda: os.getenv("LLAMACPP_URL", "").rstrip("/")
+    )
+    ollama_keep_alive: str = field(
+        default_factory=lambda: os.getenv("OLLAMA_KEEP_ALIVE", "30m")
+    )
     # Qwen3-family models think by default, which silently consumes the token
     # budget with reasoning. Default to explicit non-thinking unless a request
     # (or this env var) opts in.
     ollama_think_default: bool = field(
         default_factory=lambda: (
-            os.getenv("OLLAMA_DEFAULT_THINK", "false").strip().lower() in {"1", "true", "yes"}
+            os.getenv("OLLAMA_DEFAULT_THINK", "false").strip().lower()
+            in {"1", "true", "yes"}
         )
     )
     max_context_length: int = field(
