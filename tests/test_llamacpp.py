@@ -54,3 +54,22 @@ async def test_llamacpp_health_rejects_error_status(monkeypatch) -> None:
     backend._client = ErrorClient()
 
     assert await backend.health() is False
+
+
+def test_llamacpp_available_models_degrades_on_transport_error(monkeypatch) -> None:
+    import asyncio
+
+    import httpx
+
+    from inference.backends.llamacpp import LlamaCppBackend
+    from inference.config import settings
+
+    class FailingClient:
+        async def get(self, *args, **kwargs):
+            raise httpx.ConnectError("backend down")
+
+    backend = LlamaCppBackend()
+    backend._client = FailingClient()
+    monkeypatch.setattr(settings, "llamacpp_url", "http://llama")
+
+    assert asyncio.run(backend.available_models()) == []

@@ -88,10 +88,14 @@ class Scheduler:
         self._sweeper_task: asyncio.Task[None] | None = None
         self._circuits = {
             "ollama": CircuitBreaker(
-                settings.circuit_failure_threshold, settings.circuit_recovery_seconds
+                settings.circuit_failure_threshold,
+                settings.circuit_recovery_seconds,
+                settings.circuit_trial_timeout_seconds,
             ),
             "llama.cpp": CircuitBreaker(
-                settings.circuit_failure_threshold, settings.circuit_recovery_seconds
+                settings.circuit_failure_threshold,
+                settings.circuit_recovery_seconds,
+                settings.circuit_trial_timeout_seconds,
             ),
         }
 
@@ -103,7 +107,9 @@ class Scheduler:
     def circuit(self) -> CircuitBreaker:
         if self.backend.name not in self._circuits:
             self._circuits[self.backend.name] = CircuitBreaker(
-                settings.circuit_failure_threshold, settings.circuit_recovery_seconds
+                settings.circuit_failure_threshold,
+                settings.circuit_recovery_seconds,
+                settings.circuit_trial_timeout_seconds,
             )
         return self._circuits[self.backend.name]
 
@@ -305,7 +311,14 @@ class Scheduler:
                 acquired = True
                 self._dequeue()
                 queued = False
-                warm = await self._prepare(model, chat=False)
+                try:
+                    warm = await self._prepare(model, chat=False)
+                except InferenceError as exc:
+                    # ensure_available fails before the backend call; a
+                    # half-open trial started here never produced a verdict
+                    # (GW-15).
+                    self._backend_failure(exc)
+                    raise
                 try:
                     admit_request()
                 except InferenceError:
@@ -339,6 +352,7 @@ class Scheduler:
                     raise error from exc
                 except asyncio.CancelledError:
                     CANCELLED_REQUESTS.labels(kind="embedding").inc()
+                    self.circuit.abandon_trial()
                     raise
                 except Exception as exc:
                     error = InferenceError("INFERENCE_ERROR", str(exc), True, 503)
@@ -350,6 +364,7 @@ class Scheduler:
             except asyncio.CancelledError:
                 if not acquired:
                     CANCELLED_REQUESTS.labels(kind="queued").inc()
+                self.circuit.abandon_trial()
                 raise
         finally:
             if acquired:
@@ -372,7 +387,14 @@ class Scheduler:
                 acquired = True
                 self._dequeue()
                 queued = False
-                warm = await self._prepare(model)
+                try:
+                    warm = await self._prepare(model)
+                except InferenceError as exc:
+                    # ensure_available fails before the backend call; a
+                    # half-open trial started here never produced a verdict
+                    # (GW-15).
+                    self._backend_failure(exc)
+                    raise
                 try:
                     admit_request()
                 except InferenceError:
@@ -398,6 +420,7 @@ class Scheduler:
                     return result
                 except asyncio.CancelledError:
                     CANCELLED_REQUESTS.labels(kind="chat").inc()
+                    self.circuit.abandon_trial()
                     raise
                 except InferenceError as exc:
                     self._backend_failure(exc)
@@ -423,6 +446,7 @@ class Scheduler:
             except asyncio.CancelledError:
                 if not acquired:
                     CANCELLED_REQUESTS.labels(kind="queued").inc()
+                self.circuit.abandon_trial()
                 raise
         finally:
             if acquired:
@@ -448,7 +472,13 @@ class Scheduler:
             acquired = True
             self._dequeue()
             queued = False
-            warm = await self._prepare(model)
+            try:
+                warm = await self._prepare(model)
+            except InferenceError as exc:
+                # ensure_available fails before the backend call; a half-open
+                # trial started here never produced a verdict (GW-15).
+                self._backend_failure(exc)
+                raise
             try:
                 admit_request()
             except InferenceError:
@@ -462,6 +492,7 @@ class Scheduler:
         except asyncio.CancelledError:
             if not acquired:
                 CANCELLED_REQUESTS.labels(kind="queued").inc()
+            self.circuit.abandon_trial()
             raise
         finally:
             # Preparation failures must not leak the semaphore or queue token.
@@ -509,6 +540,11 @@ class Scheduler:
                             event = json.loads(line)
                         except (TypeError, ValueError):
                             event = {}
+                        if line.strip() == "[DONE]":
+                            # llama.cpp ends OpenAI-style streams with the
+                            # [DONE] sentinel instead of Ollama's done event
+                            # (GW-21).
+                            saw_done = True
                         if event.get("done"):
                             saw_done = True
                             load = float(event.get("load_duration") or 0) / 1e9
@@ -524,6 +560,18 @@ class Scheduler:
                                     TOKENS_PER_SECOND.labels(model=model).observe(
                                         completion / generation
                                     )
+                        openai_usage = event.get("usage")
+                        if isinstance(openai_usage, dict) and openai_usage:
+                            # OpenAI-style usage chunk (llama.cpp with
+                            # stream_options.include_usage); it always
+                            # immediately precedes [DONE].
+                            saw_done = True
+                            prompt = int(openai_usage.get("prompt_tokens") or 0)
+                            completion = int(openai_usage.get("completion_tokens") or 0)
+                            if prompt:
+                                TOKENS.labels(model=model, kind="prompt").inc(prompt)
+                            if completion:
+                                TOKENS.labels(model=model, kind="completion").inc(completion)
                         yield line
                 if not saw_done:
                     # A backend stream that ends without its terminal event is
@@ -540,6 +588,7 @@ class Scheduler:
                 REQUESTS.labels(model=model, status="success").inc()
             except asyncio.CancelledError:
                 CANCELLED_REQUESTS.labels(kind="stream").inc()
+                self.circuit.abandon_trial()
                 raise
             except InferenceError as exc:
                 self._backend_failure(exc)

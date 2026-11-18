@@ -530,3 +530,38 @@ async def test_sweeper_task_starts_and_close_cancels_it(scheduler: Scheduler) ->
 
     assert task.done()
     assert scheduler._sweeper_task is None
+
+
+class OpenAIStyleBackend(FakeBackend):
+    """A llama.cpp-style backend that streams OpenAI-format SSE chunks."""
+
+    name = "llama.cpp"
+
+    async def stream(self, model: str, payload: dict):
+        yield '{"choices":[{"delta":{"content":"hi"}}]}'
+        yield (
+            '{"choices":[{"delta":{},"finish_reason":"stop"}],'
+            '"usage":{"prompt_tokens":3,"completion_tokens":2}}'
+        )
+        yield "[DONE]"
+
+
+@pytest.mark.asyncio
+async def test_openai_style_stream_completes_without_stream_incomplete(
+    scheduler: Scheduler, monkeypatch
+) -> None:
+    """GW-21: llama.cpp streams end with [DONE], not Ollama's done event.
+
+    Before the fix, `saw_done` stayed False and every llama.cpp stream was
+    reported as STREAM_INCOMPLETE (502) after generating normally.
+    """
+    monkeypatch.setattr(settings, "llamacpp_url", "http://llama")
+    scheduler._llama = OpenAIStyleBackend()
+    lease = await scheduler.prepare_stream({"model": "qwen3:1.7b", "messages": []})
+
+    lines = []
+    async for line in scheduler._stream_prepared({"model": "qwen3:1.7b"}, lease):
+        lines.append(line)
+
+    assert lines[-1] == "[DONE]"
+    assert scheduler.status()["queue_depth"] == 0

@@ -23,6 +23,25 @@ class BodyLimitMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         if request.method == "POST" and request.url.path.startswith("/v1/"):
+            # Chunked requests carry no content-length and would bypass the
+            # size cap entirely (GW-5); reject them honestly instead of
+            # buffering an unbounded body.
+            chunked = "chunked" in (request.headers.get("transfer-encoding") or "").lower()
+            if chunked and not request.headers.get("content-length"):
+                return JSONResponse(
+                    status_code=411,
+                    content={
+                        "error": {
+                            "code": "LENGTH_REQUIRED",
+                            "message": (
+                                "chunked requests are not accepted; send "
+                                "content-length so the request size can be "
+                                "enforced"
+                            ),
+                            "retryable": False,
+                        }
+                    },
+                )
             try:
                 length = int(request.headers.get("content-length") or 0)
             except ValueError:

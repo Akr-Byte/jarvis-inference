@@ -19,7 +19,7 @@ local model backend (Ollama, or an optional llama.cpp server) and speaks the Ope
 - Jarvis remains usable for local repository work when AI Stack is stopped, and AI Stack remains
   usable when the CLI is not installed.
 
-**Current release: `0.5.0`** — see [CHANGELOG.md](CHANGELOG.md) for release notes.
+**Current release: `0.5.1`** — see [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Table of contents
 

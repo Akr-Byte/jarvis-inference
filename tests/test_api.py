@@ -436,3 +436,110 @@ def test_request_body_limit_returns_413(monkeypatch) -> None:
 
     assert response.status_code == 413
     assert response.json()["error"]["code"] == "REQUEST_TOO_LARGE"
+
+
+def test_llamacpp_stream_does_not_duplicate_done_sentinel(monkeypatch) -> None:
+    """GW-21: llama.cpp already sends [DONE]; the gateway must not add another."""
+    from inference.config import settings
+
+    _prepare_stream_stub(
+        monkeypatch,
+        ['{"choices":[{"delta":{"content":"hi"}}]}', "[DONE]"],
+    )
+    monkeypatch.setattr(settings, "llamacpp_url", "http://llama")
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "qwen3:1.7b",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.text.count("data: [DONE]") == 1
+
+
+def test_invalid_request_id_is_replaced(monkeypatch) -> None:
+    """GW-13: echoed request ids must be bounded and header-safe."""
+
+    async def fake_chat(payload: dict, request_id: str | None = None) -> dict:
+        return {"model": payload["model"], "choices": [], "usage": {}}
+
+    monkeypatch.setattr(scheduler, "chat", fake_chat)
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        headers={"X-Request-ID": "bad id\nwith control chars" + "x" * 200},
+        json={"model": "qwen3:1.7b", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    returned = response.headers["X-Request-ID"]
+    assert returned.startswith("chatcmpl-")
+    assert len(returned) <= 128
+
+
+def test_tool_choice_none_strips_tools(monkeypatch) -> None:
+    captured: dict = {}
+
+    async def fake_chat(payload: dict, request_id: str | None = None) -> dict:
+        captured.update(payload)
+        return {"model": payload["model"], "choices": [], "usage": {}}
+
+    monkeypatch.setattr(scheduler, "chat", fake_chat)
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "qwen3:1.7b",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "x"}}],
+            "tool_choice": "none",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "tools" not in captured
+    assert "tool_choice" not in captured
+
+
+def test_embeddings_report_an_estimated_token_count(monkeypatch) -> None:
+    async def fake_embeddings(
+        model: str, inputs: list[str], request_id: str | None = None
+    ) -> list[list[float]]:
+        return [[0.1, 0.2] for _ in inputs]
+
+    monkeypatch.setattr(scheduler, "embeddings", fake_embeddings)
+    response = TestClient(app).post(
+        "/v1/embeddings",
+        json={"model": "nomic-embed-text", "input": ["hello world", "second"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["usage"]["prompt_tokens"] > 0
+
+
+def test_chunked_request_without_length_is_rejected() -> None:
+    """GW-5: chunked bodies would bypass the content-length cap."""
+    import asyncio
+
+    from starlette.requests import Request
+
+    from inference.main import BodyLimitMiddleware
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [(b"transfer-encoding", b"chunked")],
+        "query_string": b"",
+    }
+
+    async def call_next(_request):
+        raise AssertionError("the request must be rejected before routing")
+
+    async def run() -> int:
+        middleware = BodyLimitMiddleware(app=None)
+        response = await middleware.dispatch(Request(scope), call_next)
+        return response.status_code
+
+    assert asyncio.run(run()) == 411

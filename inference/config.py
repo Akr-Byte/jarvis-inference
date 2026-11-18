@@ -75,6 +75,12 @@ class Settings:
     circuit_recovery_seconds: float = field(
         default_factory=lambda: max(1.0, _float("CIRCUIT_RECOVERY_SECONDS", 15.0))
     )
+    # A half-open trial request that exits without a verdict (client
+    # disconnect, admission rejection, cancellation) must not wedge the
+    # circuit: after this timeout a fresh trial is allowed (GW-15).
+    circuit_trial_timeout_seconds: float = field(
+        default_factory=lambda: max(1.0, _float("CIRCUIT_TRIAL_TIMEOUT_SECONDS", 60.0))
+    )
     default_model: str = field(default_factory=lambda: os.getenv("DEFAULT_MODEL", "qwen3:1.7b"))
     embedding_model: str = field(
         default_factory=lambda: os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
