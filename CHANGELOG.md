@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.5.1
+
+### Fixed
+
+- **GW-15 wiring**: the scheduler now passes `trial_timeout` to every circuit
+  breaker and calls `abandon_trial()` when an admitted half-open trial exits
+  without a verdict (cancellation, client disconnect, or a pre-backend
+  admission failure). Previously the trial-wedge protection existed in
+  `CircuitBreaker` but was never enabled, so a half-open trial that exited
+  without reporting success/failure could reject every caller forever.
+- **GW-21 llama.cpp streaming**: OpenAI-format streams from llama.cpp end with
+  the `data: [DONE]` sentinel rather than Ollama's `done` event. The scheduler
+  now treats `[DONE]` (and an OpenAI `usage` chunk) as the terminal event
+  instead of failing every llama.cpp stream with `502 STREAM_INCOMPLETE`, and
+  token metrics are recorded from the OpenAI usage chunk. The gateway no
+  longer appends a duplicate `[DONE]` when the backend already sent one.
+- **GW-5 chunked bodies**: `POST /v1/*` requests using
+  `Transfer-Encoding: chunked` without a `content-length` are rejected with
+  `411 LENGTH_REQUIRED` instead of bypassing the request-size cap.
+- **GW-13 request ids**: client-supplied `X-Request-ID` values are only echoed
+  when they are at most 128 header-safe characters; otherwise a generated id
+  is used. The previous behavior echoed arbitrary/unbounded values into
+  response headers and payload `id` fields.
+- **GW-11 tool_choice honesty**: `tool_choice=none` is now enforced by
+  stripping the tools; other values are tolerated but explicitly advertised as
+  unenforced via `/v1/capabilities.limitations`.
+- Embeddings responses report an estimated `usage.prompt_tokens` instead of a
+  misleading zero.
+- `LlamaCppBackend.available_models()` degrades to an empty catalog on
+  transport errors instead of leaking a raw `httpx` exception through the
+  readiness path.
+
 ## 0.5.0
 
 ### Breaking / wire-contract changes

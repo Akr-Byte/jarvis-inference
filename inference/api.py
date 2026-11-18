@@ -4,6 +4,7 @@ import base64
 import hmac
 import json
 import logging
+import re
 import struct
 import time
 import uuid
@@ -24,6 +25,10 @@ from inference.schemas import ChatCompletionRequest, EmbeddingRequest, ModelInfo
 router = APIRouter()
 
 logger = logging.getLogger("jarvis.api")
+
+# Client-supplied request ids are echoed into response headers and payload id
+# fields; only bounded alphanumeric ids are accepted (GW-13).
+_SAFE_REQUEST_ID = re.compile(r"[A-Za-z0-9._:@/-]{1,128}")
 
 # Parameters tolerated by the request schema (extra="allow") but not
 # implemented by this gateway. They are rejected with an explicit
@@ -91,7 +96,16 @@ def _bearer(value: str | None) -> str | None:
 
 
 def _request_id(request: Request) -> str:
-    return request.headers.get("X-Request-ID") or f"chatcmpl-{uuid.uuid4().hex}"
+    """Echo a client-supplied X-Request-ID only when it is safe (GW-13).
+
+    The value is reused in response headers, JSON `id` fields and tool-call
+    ids, so it must be bounded and restricted to header-safe characters;
+    anything else is replaced with a generated id.
+    """
+    candidate = (request.headers.get("X-Request-ID") or "").strip()
+    if candidate and len(candidate) <= 128 and _SAFE_REQUEST_ID.fullmatch(candidate):
+        return candidate
+    return f"chatcmpl-{uuid.uuid4().hex}"
 
 
 @router.get("/health")
@@ -127,6 +141,9 @@ async def embeddings(
         vectors = await scheduler.embeddings(model, inputs, request_id=request_id)
     except InferenceError as exc:
         return _error_response(exc, request_id)
+    # Embedding backends do not report token counts; report a conservative
+    # estimate instead of a dishonest zero (GW-11).
+    estimated_tokens = max(1, (sum(len(str(item)) for item in inputs) + 2 * len(inputs)) // 3)
     return JSONResponse(
         content={
             "object": "list",
@@ -139,7 +156,7 @@ async def embeddings(
                 for index, vector in enumerate(vectors)
             ],
             "model": model,
-            "usage": {"prompt_tokens": 0, "total_tokens": 0},
+            "usage": {"prompt_tokens": estimated_tokens, "total_tokens": estimated_tokens},
         },
         headers={"X-Request-ID": request_id},
     )
@@ -174,6 +191,10 @@ async def capabilities(
             "embeddings",
             "model_catalog",
             "request_ids",
+        ],
+        "limitations": [
+            "tool_choice is tolerated but not enforced by the backend "
+            "(only tool_choice=none is applied, by stripping the tools)"
         ],
         "models": models,
         "limits": {
@@ -235,6 +256,14 @@ async def chat(
             },
             headers=_error_headers(request_id),
         )
+    # tool_choice honesty (GW-11): the backend ignores tool_choice entirely.
+    # The only enforceable value is "none", which the gateway applies itself
+    # by stripping the tools; "auto" is the backend default and other values
+    # are tolerated but NOT enforced (advertised via /v1/capabilities).
+    tool_choice = body.get("tool_choice")
+    if tool_choice == "none":
+        body.pop("tools", None)
+        body.pop("tool_choice", None)
     if payload.stream:
         try:
             lease = await scheduler.prepare_stream(body, request_id=request_id)
@@ -269,6 +298,7 @@ async def _stream(
     model = str(body["model"])
     model_manager.validate_chat(model)
     backend = scheduler.backend
+    openai_done_sent = False
     # OpenAI streaming semantics (GW-4a): when the client asks for usage via
     # stream_options.include_usage, the usage object ships in a final
     # usage-only chunk with empty choices — not inside the content chunk.
@@ -365,6 +395,11 @@ async def _stream(
                     }
                     yield f"data: {json.dumps(usage_chunk)}\n\n"
             else:
+                # llama.cpp streams OpenAI-format chunks verbatim, including
+                # its own terminal `data: [DONE]` sentinel; only append the
+                # gateway sentinel when the backend did not send one (GW-21).
+                if line.strip() == "[DONE]":
+                    openai_done_sent = True
                 yield f"data: {line}\n\n"
     except InferenceError as exc:
         # Once SSE headers are committed, communicate backend failures as an
@@ -380,4 +415,5 @@ async def _stream(
         yield f"data: {json.dumps(error_event)}\n\n"
         yield "data: [DONE]\n\n"
         return
-    yield "data: [DONE]\n\n"
+    if not openai_done_sent:
+        yield "data: [DONE]\n\n"
