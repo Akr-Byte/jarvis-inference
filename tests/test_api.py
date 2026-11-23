@@ -516,6 +516,7 @@ def test_embeddings_report_an_estimated_token_count(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json()["usage"]["prompt_tokens"] > 0
+    assert response.json()["usage"]["prompt_tokens_estimated"] is True
 
 
 def test_chunked_request_without_length_is_rejected() -> None:

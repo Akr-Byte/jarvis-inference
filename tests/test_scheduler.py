@@ -7,7 +7,7 @@ from inference.config import settings
 from inference.errors import InferenceError
 from inference.metrics import ACTIVE_MODEL
 from inference.models import model_manager
-from inference.scheduler import Scheduler, _check_context_window
+from inference.scheduler import Scheduler, _check_context_window, estimate_prompt_tokens
 
 
 class FakeBackend:
@@ -587,6 +587,31 @@ def test_context_admission_supports_128k_and_reserves_output(monkeypatch) -> Non
                 "num_ctx": 131072,
                 "max_tokens": 8192,
             }
+        )
+
+
+def test_context_heuristic_handles_multilingual_and_code_as_estimates(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "max_context_length", 8192)
+    monkeypatch.setattr(settings, "max_output_tokens", 512)
+    multilingual = [{"role": "user", "content": "こんにちは 世界 مرحبا بالعالم"}]
+    code = [
+        {
+            "role": "user",
+            "content": "def f(x):\n    return {'a': x**2, 'b': [i for i in range(20)]}",
+        }
+    ]
+
+    assert estimate_prompt_tokens(multilingual) > 0
+    assert estimate_prompt_tokens(code) > 0
+    assert estimate_prompt_tokens(
+        {"messages": [], "tools": [{"name": "search", "schema": "x" * 90}]}
+    ) > estimate_prompt_tokens({"messages": []})
+    # A tokenizer result, when provided, is used as an actual count and named
+    # separately from the byte-length fallback in admission diagnostics.
+    with pytest.raises(InferenceError, match="tokenizer-counted prompt"):
+        _check_context_window(
+            {"messages": code, "num_ctx": 100, "max_tokens": 20},
+            actual_prompt_tokens=90,
         )
 
 

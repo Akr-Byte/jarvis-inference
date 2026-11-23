@@ -229,9 +229,9 @@ With `LLAMACPP_MANAGED=true`, the gateway starts only the child process it creat
 output to `LLAMACPP_LOG_FILE`, checks `/health` before serving, restarts that child after an
 unexpected exit up to `LLAMACPP_MAX_RESTARTS`, and terminates that child during shutdown. It probes
 the executable's `--help` output before using optional flags. Startup reads GGUF context and KV
-metadata and rejects contexts beyond the model's training limit or estimated memory beyond the
-configured budget and headroom. Missing KV or trained-context metadata is rejected above 32K
-context rather than treated as safe. It never discovers, adopts or signals an independently started `llama-server`.
+metadata and rejects contexts beyond a declared model context or estimated memory beyond the
+configured budget and headroom. Incomplete KV metadata is rejected rather than treated as a safe
+estimate. It never discovers, adopts or signals an independently started `llama-server`.
 Leave `LLAMACPP_MANAGED=false` and set `LLAMACPP_URL` to use an externally supervised server. The
 default Ollama deployment remains unchanged.
 
@@ -252,6 +252,17 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"workstation-model","messages":[{"role":"user","content":"Reply with OK"}],"max_tokens":32}'
 ```
+
+Managed llama.cpp estimates memory from GGUF file size, architecture-specific KV and recurrent
+state metadata, configured cache limits, and estimated batch/compute/runtime reserves. Runtime
+status reports each component and observed child RSS separately; these estimates are not actual or
+guaranteed process consumption. Missing or inconsistent Qwen3-Next hybrid metadata fails admission
+because a conventional all-attention estimate would be misleading. Context admission uses llama.cpp's
+rendered-chat token-count endpoint when supported; otherwise the JSON UTF-8 byte-length heuristic
+is explicitly an estimate, and backend usage remains the actual usage when provided.
+`MAX_CONTEXT_LENGTH` is the per-request context. Managed mode sizes llama-server's total context
+pool as `MAX_CONTEXT_LENGTH * LLAMACPP_PARALLEL`, so each configured slot retains the requested
+per-request context and memory admission accounts for every slot.
 
 The constrained Ollama example is [.env.constrained-homelab.example](.env.constrained-homelab.example).
 It keeps 8K context, one active generation and the existing Ollama backend. The installer creates

@@ -11,6 +11,9 @@
   checks for managed local runtimes.
 - Workstation and constrained homelab environment profiles. Existing Ollama defaults remain in
   place.
+- Qwen3-Next hybrid attention/recurrent memory estimation, component-level managed-runtime
+  admission diagnostics, tokenizer-backed llama.cpp chat context checks, and startup/shutdown race
+  protection for the owned process group.
 
 ## 0.5.1
 

@@ -7,16 +7,30 @@ from inference.config import settings
 from inference.llamacpp_runtime import LlamaCppRuntime, RuntimeState
 
 
+def _metadata(context: int = 32768) -> dict[str, object]:
+    return {
+        "general.architecture": "llama",
+        "llama.context_length": context,
+        "llama.block_count": 2,
+        "llama.embedding_length": 64,
+        "llama.attention.head_count": 4,
+        "llama.attention.head_count_kv": 2,
+        "llama.attention.key_length": 16,
+        "llama.attention.value_length": 16,
+    }
+
+
 def test_managed_command_carries_workstation_tuning(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(settings, "llamacpp_model", str(tmp_path / "part-00001.gguf"))
     monkeypatch.setattr(settings, "llamacpp_alias", "workstation")
     monkeypatch.setattr(settings, "max_context_length", 131072)
+    monkeypatch.setattr(settings, "llamacpp_parallel", 2)
     monkeypatch.setattr(settings, "llamacpp_threads", 12)
     monkeypatch.setattr(settings, "llamacpp_cache_type_k", "q8_0")
     command = LlamaCppRuntime().command()
     assert command[command.index("--model") + 1].endswith("part-00001.gguf")
     assert command[command.index("--alias") + 1] == "workstation"
-    assert command[command.index("--ctx-size") + 1] == "131072"
+    assert command[command.index("--ctx-size") + 1] == "262144"
     assert command[command.index("--threads") + 1] == "12"
     assert command[command.index("--cache-type-k") + 1] == "q8_0"
 
@@ -38,6 +52,7 @@ async def test_unmanaged_runtime_does_not_spawn_or_signal_process(monkeypatch) -
 @pytest.mark.asyncio
 async def test_stop_terminates_only_owned_child(monkeypatch, tmp_path) -> None:
     class Child:
+        pid = 4321
         returncode = None
         terminated = False
 
@@ -50,6 +65,14 @@ async def test_stop_terminates_only_owned_child(monkeypatch, tmp_path) -> None:
 
     runtime = LlamaCppRuntime()
     child = Child()
+
+    def killpg(pid, sig):
+        if sig == 15:
+            child.terminate()
+        elif sig == 0:
+            raise ProcessLookupError
+
+    monkeypatch.setattr("inference.llamacpp_runtime.os.killpg", killpg)
     runtime.process = child
     runtime._log = (tmp_path / "server.log").open("wb")
     await runtime.stop()
@@ -87,10 +110,15 @@ async def test_start_creates_managed_child_and_reports_owned_pid(monkeypatch, tm
     monkeypatch.setattr(settings, "llamacpp_log_file", str(tmp_path / "llama.log"))
     monkeypatch.setattr(runtime, "detect_capabilities", _async_value({}))
     monkeypatch.setattr(runtime, "_wait_healthy", _async_value(None))
-    monkeypatch.setattr("inference.llamacpp_runtime.read_metadata", lambda path: {})
-    monkeypatch.setattr("inference.llamacpp_runtime.kv_bytes_per_token", lambda *args: 0)
+    monkeypatch.setattr("inference.llamacpp_runtime.read_metadata", lambda path: _metadata())
     monkeypatch.setattr("inference.llamacpp_runtime.discover_gguf", lambda path: [])
     monkeypatch.setattr("inference.llamacpp_runtime.memory_available_gb", lambda: 48.0)
+    monkeypatch.setattr(
+        "inference.llamacpp_runtime.os.killpg",
+        lambda pid, sig: (
+            child.terminate() if sig == 15 else (_ for _ in ()).throw(ProcessLookupError())
+        ),
+    )
 
     async def spawn(*args, **kwargs):
         return child
@@ -102,6 +130,71 @@ async def test_start_creates_managed_child_and_reports_owned_pid(monkeypatch, tm
     assert runtime.status()["owns_process"] is True
     assert runtime.state.value == "ready"
     await runtime.stop()
+    assert child.returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_shutdown_during_startup_waits_for_owned_child_and_stops_it(
+    monkeypatch, tmp_path
+) -> None:
+    class Child:
+        pid = 9876
+        returncode = None
+
+        def __init__(self):
+            self.exited = asyncio.Event()
+            self.stdout = asyncio.StreamReader()
+
+        def terminate(self):
+            self.returncode = 0
+            self.exited.set()
+            self.stdout.feed_eof()
+
+        async def wait(self):
+            await self.exited.wait()
+            return self.returncode
+
+    child = Child()
+    entered_health = asyncio.Event()
+    release_health = asyncio.Event()
+    runtime = LlamaCppRuntime()
+    model = tmp_path / "tiny.gguf"
+    model.write_bytes(b"gguf")
+    monkeypatch.setattr(settings, "llamacpp_managed", True)
+    monkeypatch.setattr(settings, "llamacpp_model", str(model))
+    monkeypatch.setattr(settings, "llamacpp_alias", "tiny")
+    monkeypatch.setattr(settings, "llamacpp_url", "http://127.0.0.1:8081")
+    monkeypatch.setattr(settings, "llamacpp_log_file", str(tmp_path / "llama.log"))
+    monkeypatch.setattr(runtime, "detect_capabilities", _async_value({}))
+    monkeypatch.setattr("inference.llamacpp_runtime.read_metadata", lambda path: _metadata())
+    monkeypatch.setattr("inference.llamacpp_runtime.discover_gguf", lambda path: [])
+    monkeypatch.setattr("inference.llamacpp_runtime.memory_available_gb", lambda: 48.0)
+
+    async def wait_for_health():
+        entered_health.set()
+        await release_health.wait()
+
+    async def spawn(*args, **kwargs):
+        return child
+
+    def killpg(pid, sig):
+        if sig == 15:
+            child.terminate()
+        elif sig == 0:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(runtime, "_wait_healthy", wait_for_health)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr("inference.llamacpp_runtime.os.killpg", killpg)
+    start_task = asyncio.create_task(runtime.start())
+    await entered_health.wait()
+    stop_task = asyncio.create_task(runtime.stop())
+    await asyncio.sleep(0)
+    release_health.set()
+    await asyncio.gather(start_task, stop_task)
+
+    assert runtime.state is RuntimeState.STOPPED
+    assert runtime.process is None
     assert child.returncode == 0
 
 
@@ -138,9 +231,12 @@ async def test_start_rejects_context_when_gguf_memory_metadata_is_missing(
     monkeypatch.setattr(settings, "llamacpp_url", "http://127.0.0.1:8081")
     monkeypatch.setattr(settings, "max_context_length", 131072)
     monkeypatch.setattr(runtime, "detect_capabilities", _async_value({}))
-    monkeypatch.setattr("inference.llamacpp_runtime.read_metadata", lambda path: {})
+    monkeypatch.setattr(
+        "inference.llamacpp_runtime.read_metadata",
+        lambda path: {"general.architecture": "llama", "llama.context_length": 262144},
+    )
 
-    with pytest.raises(RuntimeError, match="cannot estimate KV memory"):
+    with pytest.raises(RuntimeError, match="embedding_length"):
         await runtime.start()
 
     assert runtime.state.value == "failed"
@@ -157,7 +253,7 @@ async def test_start_rejects_incomplete_split_model(monkeypatch, tmp_path) -> No
     monkeypatch.setattr(settings, "llamacpp_alias", "model")
     monkeypatch.setattr(settings, "llamacpp_url", "http://127.0.0.1:8081")
     monkeypatch.setattr(runtime, "detect_capabilities", _async_value({}))
-    monkeypatch.setattr("inference.llamacpp_runtime.read_metadata", lambda path: {})
+    monkeypatch.setattr("inference.llamacpp_runtime.read_metadata", lambda path: _metadata())
     monkeypatch.setattr("inference.llamacpp_runtime.discover_gguf", lambda path: [])
 
     with pytest.raises(RuntimeError, match="split GGUF shards are incomplete"):
@@ -177,8 +273,9 @@ async def test_start_requires_trained_context_metadata_above_32k(monkeypatch, tm
     monkeypatch.setattr(settings, "llamacpp_url", "http://127.0.0.1:8081")
     monkeypatch.setattr(settings, "max_context_length", 131072)
     monkeypatch.setattr(runtime, "detect_capabilities", _async_value({}))
-    monkeypatch.setattr("inference.llamacpp_runtime.read_metadata", lambda path: {})
-    monkeypatch.setattr("inference.llamacpp_runtime.kv_bytes_per_token", lambda *args: 8)
+    monkeypatch.setattr(
+        "inference.llamacpp_runtime.read_metadata", lambda path: _metadata(context=0)
+    )
     monkeypatch.setattr("inference.llamacpp_runtime.discover_gguf", lambda path: [])
 
     with pytest.raises(RuntimeError, match="does not declare its trained context"):
@@ -211,6 +308,123 @@ def test_gguf_metadata_reads_model_context(tmp_path) -> None:
         + struct.pack("<II", 4, 131072)
     )
     assert read_metadata(path)["qwen3.context_length"] == 131072
+
+
+def test_qwen3next_hybrid_kv_and_recurrent_state_estimate() -> None:
+    from inference.gguf import estimate_kv_memory, kv_bytes_per_token
+
+    recurrent = [index % 4 != 3 for index in range(48)]
+    metadata = {
+        "general.architecture": "qwen3next",
+        "qwen3next.block_count": 48,
+        "qwen3next.embedding_length": 2048,
+        "qwen3next.attention.head_count": 16,
+        "qwen3next.attention.head_count_kv": 2,
+        "qwen3next.attention.key_length": 256,
+        "qwen3next.attention.value_length": 256,
+        "qwen3next.attention.recurrent_layers": recurrent,
+        "qwen3next.ssm.conv_kernel": 4,
+        "qwen3next.ssm.inner_size": 4096,
+        "qwen3next.ssm.state_size": 128,
+        "qwen3next.ssm.time_step_rank": 32,
+        "qwen3next.ssm.group_count": 16,
+    }
+
+    assert kv_bytes_per_token(metadata) == 12 * 2 * (256 * 2 + 256 * 2)
+    estimated = estimate_kv_memory(metadata, context_tokens=131072)
+    assert estimated.complete
+    assert estimated.attention_layers == 12
+    assert estimated.recurrent_layers == 36
+    assert estimated.recurrent_state_bytes_per_sequence == 36 * 4 * (
+        4 * (2 * 128 * 16 + 2 * 4096) + 128 * 4096
+    )
+    assert estimated.bytes_total == 24576 * 131072 + estimated.recurrent_state_bytes_per_sequence
+
+    interval_metadata = dict(metadata)
+    del interval_metadata["qwen3next.attention.recurrent_layers"]
+    interval_metadata["qwen3next.full_attention_interval"] = 4
+    interval_estimate = estimate_kv_memory(interval_metadata, context_tokens=131072)
+    assert interval_estimate == estimated
+
+    quantized = estimate_kv_memory(
+        metadata, context_tokens=131072, cache_type="q8_0", cache_type_v="q8_0"
+    )
+    assert quantized.complete
+    assert quantized.bytes_total < estimated.bytes_total
+
+
+def test_qwen3next_requires_hybrid_layout_and_ssm_metadata() -> None:
+    from inference.gguf import estimate_kv_memory
+
+    metadata = {
+        "general.architecture": "qwen3next",
+        "qwen3next.block_count": 48,
+        "qwen3next.attention.head_count": 16,
+        "qwen3next.attention.head_count_kv": 2,
+        "qwen3next.attention.key_length": 256,
+        "qwen3next.attention.value_length": 256,
+    }
+    estimate = estimate_kv_memory(metadata, context_tokens=32768)
+    assert not estimate.complete
+    assert estimate.bytes_total is None
+
+
+def test_other_hybrid_architectures_do_not_fall_back_to_transformer_kv() -> None:
+    from inference.gguf import kv_bytes_per_token
+
+    assert (
+        kv_bytes_per_token(
+            {
+                "general.architecture": "mamba2",
+                "mamba2.block_count": 48,
+                "mamba2.attention.head_count_kv": 2,
+                "mamba2.attention.key_length": 128,
+                "mamba2.attention.value_length": 128,
+            }
+        )
+        is None
+    )
+
+
+def test_memory_estimate_lists_components_and_rejects_invalid_batch(monkeypatch) -> None:
+    from inference.llamacpp_runtime import estimate_runtime_memory, require_memory_capacity
+
+    monkeypatch.setattr("inference.llamacpp_runtime.memory_available_gb", lambda: 64.0)
+    monkeypatch.setattr(settings, "memory_budget_gb", 1.0)
+    estimate = estimate_runtime_memory(
+        model_bytes=1024**3,
+        metadata=_metadata(),
+        context_tokens=4096,
+        parallel_sequences=1,
+        batch_size=512,
+        ubatch_size=128,
+        cache_ram_bytes=256 * 1024**2,
+        prompt_cache_enabled=True,
+    )
+    assert estimate.components_bytes["model_weights"] == 1024**3
+    assert estimate.components_bytes["model_load_alignment_reserve"] == int(0.1 * 1024**3)
+    assert estimate.components_bytes["kv_and_recurrent_state"] > 0
+    assert estimate.components_bytes["prompt_cache_reserve"] == 256 * 1024**2
+    assert estimate.components_bytes["batch_buffers"] > 0
+    assert estimate.components_bytes["compute_buffers"] > 0
+    assert estimate.components_bytes["runtime_overhead"] > 0
+    assert estimate.estimated_bytes == sum(estimate.components_bytes.values())
+    assert not estimate.complete
+    assert estimate.headroom_bytes > 0
+    with pytest.raises(RuntimeError, match="exceeds admission capacity"):
+        require_memory_capacity(estimate)
+
+    with pytest.raises(ValueError, match="micro-batch"):
+        estimate_runtime_memory(
+            model_bytes=1,
+            metadata=_metadata(),
+            context_tokens=4096,
+            parallel_sequences=1,
+            batch_size=64,
+            ubatch_size=128,
+            cache_ram_bytes=0,
+            prompt_cache_enabled=False,
+        )
 
 
 def test_discovery_groups_complete_split_gguf_shards(tmp_path) -> None:

@@ -42,3 +42,4 @@ known-first-party = ["inference"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = ["integration: opt-in tests that exercise a locally configured model and runtime"]
