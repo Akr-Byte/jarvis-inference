@@ -46,13 +46,12 @@ class StreamLease:
     released: bool = False
 
 
-def _check_context_window(payload: dict[str, Any]) -> None:
+def _check_context_window(payload: dict[str, Any], actual_prompt_tokens: int | None = None) -> None:
     """Reject requests that cannot fit the effective context window (GW-6).
 
-    Only an explicit num_ctx override was checked before; the actual prompt
-    was never measured, so oversized prompts were silently truncated by the
-    backend with HTTP 200. The estimate is deliberately conservative
-    (escaped characters count) for admission purposes.
+    llama.cpp's tokenizer route counts the rendered chat prompt when present.
+    Otherwise this uses a UTF-8 JSON byte-length heuristic, which is explicitly
+    an estimate and may differ from the backend tokenizer.
     """
     requested_context = payload.get("num_ctx")
     if requested_context is not None and int(requested_context) > settings.max_context_length:
@@ -77,19 +76,71 @@ def _check_context_window(payload: dict[str, Any]) -> None:
             400,
         )
     messages = payload.get("messages", [])
-    estimated = (len(json.dumps(messages).encode("utf-8")) + 2) // 3
+    prompt_payload = {
+        key: value
+        for key, value in payload.items()
+        if key
+        not in {
+            "max_tokens",
+            "max_completion_tokens",
+            "num_ctx",
+            "stream",
+            "stream_options",
+            "temperature",
+            "top_p",
+            "top_k",
+            "seed",
+            "stop",
+            "presence_penalty",
+            "frequency_penalty",
+        }
+    }
+    estimated = estimate_prompt_tokens(prompt_payload or messages)
+    prompt_tokens = actual_prompt_tokens if actual_prompt_tokens is not None else estimated
     CONTEXT_USAGE.labels(model=str(payload.get("model") or settings.default_model)).observe(
-        (estimated + output_budget) / effective
+        (prompt_tokens + output_budget) / effective
     )
-    if estimated + output_budget > effective:
+    if prompt_tokens + output_budget > effective:
+        count_label = (
+            "tokenizer-counted prompt" if actual_prompt_tokens is not None else "estimated prompt"
+        )
         raise InferenceError(
             "CONTEXT_LIMIT_EXCEEDED",
-            f"estimated prompt ({estimated} tokens) plus output budget ({output_budget} tokens) "
+            f"{count_label} ({prompt_tokens} tokens) plus output budget ({output_budget} tokens) "
             f"exceeds the {effective} token context window; shorten the conversation or "
             "adjust MAX_CONTEXT_LENGTH/MAX_OUTPUT_TOKENS",
             False,
             400,
         )
+
+
+def estimate_prompt_tokens(messages: Any) -> int:
+    """Estimate serialized prompt/tool bytes; this is not tokenizer output."""
+    escaped = json.dumps(messages, ensure_ascii=True)
+    prompt = json.dumps(messages, ensure_ascii=False)
+    byte_estimate = (len(escaped.encode("utf-8")) + 2) // 3
+    # Count every punctuation run character separately to reduce undercounting
+    # code, JSON schemas and operator-heavy prompts. This remains a heuristic.
+    groups = 0
+    in_word = False
+    for char in prompt:
+        if char.isalnum() or ord(char) > 127:
+            if not in_word:
+                groups += 1
+            in_word = True
+        elif char.isspace():
+            in_word = False
+        else:
+            groups += 1
+            in_word = False
+    return max(byte_estimate, groups)
+
+
+async def _admit_context_window(payload: dict[str, Any], backend: LlamaCppBackend) -> None:
+    model = str(payload.get("model") or settings.default_model)
+    tokenizer = getattr(backend, "count_chat_tokens", None)
+    actual = await tokenizer(model, payload) if tokenizer else None
+    _check_context_window(payload, actual_prompt_tokens=actual)
 
 
 class Scheduler:
@@ -405,7 +456,7 @@ class Scheduler:
     async def chat(self, payload: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
         model = str(payload.get("model") or settings.default_model)
         model_manager.validate_chat(model)
-        _check_context_window(payload)
+        await _admit_context_window(payload, self._llama)
         payload = dict(payload)
         payload.setdefault("max_tokens", settings.max_output_tokens)
         request_id = request_id or self._new_request_id()
@@ -492,7 +543,7 @@ class Scheduler:
         """Admit a stream before HTTP headers are committed by StreamingResponse."""
         model = str(payload.get("model") or settings.default_model)
         model_manager.validate_chat(model)
-        _check_context_window(payload)
+        await _admit_context_window(payload, self._llama)
         payload = dict(payload)
         payload.setdefault("max_tokens", settings.max_output_tokens)
         request_id = request_id or self._new_request_id()

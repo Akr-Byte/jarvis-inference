@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import shutil
+import signal
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 
 import httpx
+import psutil
 
 from inference.config import settings
-from inference.gguf import kv_bytes_per_token, read_metadata
+from inference.gguf import estimate_kv_memory, read_metadata
 from inference.model_registry import discover_gguf
 from inference.resources import memory_available_gb
 
@@ -39,6 +43,79 @@ class RuntimeState(StrEnum):
     FAILED = "failed"
 
 
+@dataclass(frozen=True)
+class MemoryEstimate:
+    components_bytes: dict[str, int]
+    estimated_bytes: int
+    headroom_bytes: int
+    capacity_bytes: int
+    complete: bool
+    notes: tuple[str, ...]
+
+
+def estimate_runtime_memory(
+    *,
+    model_bytes: int,
+    metadata: dict[str, object],
+    context_tokens: int,
+    parallel_sequences: int,
+    batch_size: int,
+    ubatch_size: int,
+    cache_ram_bytes: int,
+    prompt_cache_enabled: bool,
+) -> MemoryEstimate:
+    if min(model_bytes, context_tokens, parallel_sequences, batch_size, ubatch_size) <= 0:
+        raise ValueError("model size, context, parallelism, and batch sizes must be positive")
+    if ubatch_size > batch_size:
+        raise ValueError("micro-batch size cannot exceed batch size")
+    if cache_ram_bytes < 0:
+        raise ValueError("prompt cache RAM limit cannot be negative")
+    architecture = str(metadata.get("general.architecture") or "unknown")
+    hidden = metadata.get(f"{architecture}.embedding_length")
+    if not isinstance(hidden, int) or hidden <= 0:
+        raise ValueError("GGUF embedding_length metadata is required for memory admission")
+    kv = estimate_kv_memory(
+        metadata,
+        context_tokens,
+        parallel_sequences,
+        settings.llamacpp_cache_type_k or "f16",
+        settings.llamacpp_cache_type_v or settings.llamacpp_cache_type_k or "f16",
+    )
+    if not kv.complete or kv.bytes_total is None:
+        raise ValueError(f"cannot safely estimate {architecture} KV/recurrent memory: {kv.reason}")
+    load_slack_bytes = int(model_bytes * 0.10)
+    batch_bytes = int(batch_size * hidden * 4 * 2)
+    compute_bytes = int(ubatch_size * hidden * 4 * 4 + context_tokens * hidden * 4)
+    cache_bytes = (
+        cache_ram_bytes if cache_ram_bytes else (kv.bytes_total if prompt_cache_enabled else 0)
+    )
+    runtime_bytes = max(512 * 1024**2, int((model_bytes + load_slack_bytes) * 0.05))
+    components = {
+        "model_weights": model_bytes,
+        "model_load_alignment_reserve": load_slack_bytes,
+        "kv_and_recurrent_state": kv.bytes_total,
+        "prompt_cache_reserve": cache_bytes,
+        "batch_buffers": batch_bytes,
+        "compute_buffers": compute_bytes,
+        "runtime_overhead": runtime_bytes,
+    }
+    components["uncertainty_reserve"] = max(1024**3, int(sum(components.values()) * 0.20))
+    incomplete_notes = (
+        "compute buffers and runtime overhead are conservative estimates",
+        "prompt-cache reserve covers one context unless LLAMACPP_CACHE_RAM_MIB sets a larger bound",
+        "GGUF file size does not establish actual resident process memory",
+    )
+    estimate = sum(components.values())
+    return MemoryEstimate(
+        components,
+        estimate,
+        int(settings.memory_headroom_gb * 1024**3),
+        int(min(memory_available_gb(), settings.memory_budget_gb) * 1024**3),
+        False,
+        incomplete_notes,
+    )
+
+
 class LlamaCppRuntime:
     """Own only child processes created here; never signal port occupants or adopt PIDs."""
 
@@ -53,11 +130,13 @@ class LlamaCppRuntime:
         self._lock = asyncio.Lock()
         self.state = RuntimeState.STOPPED
         self.last_error: str | None = None
+        self.last_return_code: int | None = None
         self.restart_count = 0
         self._recovery_attempts = 0
         self.supported_flags: set[str] | None = None
         self._capability_probe_error: str | None = None
         self.model_memory_estimate_gb: float | None = None
+        self.memory_estimate: MemoryEstimate | None = None
         self.model_context_capability: int | None = None
         self.active_model_id: str | None = None
         self.active_model_path: str | None = None
@@ -151,7 +230,7 @@ class LlamaCppRuntime:
             "--port",
             str(settings.llamacpp_port),
             "--ctx-size",
-            str(settings.max_context_length),
+            str(settings.max_context_length * settings.llamacpp_parallel),
             "--threads",
             str(settings.llamacpp_threads),
             "--batch-size",
@@ -200,6 +279,7 @@ class LlamaCppRuntime:
         if not settings.llamacpp_managed:
             return
         async with self._lock:
+            self._stopping = False
             if self.process and self.process.returncode is None:
                 if model_id is None or model_id == self.active_model_id:
                     return
@@ -215,6 +295,7 @@ class LlamaCppRuntime:
             self.last_error = None
             self._recovery_attempts = 0
             self.model_memory_estimate_gb = None
+            self.memory_estimate = None
             self.model_context_capability = None
             try:
                 if model_id is not None:
@@ -260,7 +341,11 @@ class LlamaCppRuntime:
                     ) from exc
                 architecture = str(metadata.get("general.architecture") or "llama")
                 trained_context = metadata.get(f"{architecture}.context_length")
-                self.model_context_capability = int(trained_context) if trained_context else None
+                self.model_context_capability = (
+                    int(trained_context)
+                    if isinstance(trained_context, int) and trained_context > 0
+                    else None
+                )
                 if (
                     self.model_context_capability
                     and settings.max_context_length > self.model_context_capability
@@ -269,17 +354,9 @@ class LlamaCppRuntime:
                         f"configured context {settings.max_context_length} exceeds the model's "
                         f"trained context {self.model_context_capability}"
                     )
-                kv_per_token = kv_bytes_per_token(
-                    metadata,
-                    settings.llamacpp_cache_type_k or "f16",
-                    settings.llamacpp_cache_type_v or "f16",
-                )
-                if kv_per_token is None and settings.max_context_length > 32768:
-                    raise RuntimeError(
-                        "cannot estimate KV memory for this GGUF at context lengths above 32768; "
-                        "set supported model metadata or use a smaller MAX_CONTEXT_LENGTH"
-                    )
-                if trained_context is None and settings.max_context_length > 32768:
+                if settings.max_context_length < 1 or settings.llamacpp_parallel < 1:
+                    raise RuntimeError("context and parallel sequence settings must be positive")
+                if self.model_context_capability is None and settings.max_context_length > 32768:
                     raise RuntimeError(
                         "the GGUF does not declare its trained context length; use a context of "
                         "32768 or less unless the model metadata is corrected"
@@ -298,21 +375,41 @@ class LlamaCppRuntime:
                         "restore every shard before starting the model"
                     )
                 model_bytes = related.size_bytes if related else model_path.stat().st_size
-                kv_bytes = (kv_per_token or 0) * settings.max_context_length
-                estimate = max(
-                    (model_bytes * 1.10 + kv_bytes + settings.llamacpp_cache_ram_mib * 1024**2)
-                    / 1024**3,
-                    settings.model_memory_estimate_gb,
-                )
-                self.model_memory_estimate_gb = round(estimate, 2)
-                capacity = min(memory_available_gb(), settings.memory_budget_gb)
-                if estimate + settings.memory_headroom_gb > capacity:
-                    raise RuntimeError(
-                        f"estimated model/runtime memory {estimate:.1f} GiB plus configured "
-                        f"headroom {settings.memory_headroom_gb:.1f} GiB exceeds available "
-                        f"inference budget {capacity:.1f} GiB; lower context or set a suitable "
-                        "MEMORY_BUDGET_GB after checking host capacity"
+                try:
+                    memory_estimate = estimate_runtime_memory(
+                        model_bytes=model_bytes,
+                        metadata=metadata,
+                        context_tokens=settings.max_context_length,
+                        parallel_sequences=settings.llamacpp_parallel,
+                        batch_size=settings.llamacpp_batch_size,
+                        ubatch_size=settings.llamacpp_ubatch_size,
+                        cache_ram_bytes=settings.llamacpp_cache_ram_mib * 1024**2,
+                        prompt_cache_enabled=settings.llamacpp_cache_prompt,
                     )
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"managed runtime memory configuration is invalid: {exc}"
+                    ) from exc
+                self.memory_estimate = memory_estimate
+                estimate_bytes = memory_estimate.estimated_bytes
+                if settings.model_memory_estimate_gb:
+                    estimate_bytes = max(
+                        estimate_bytes, int(settings.model_memory_estimate_gb * 1024**3)
+                    )
+                if estimate_bytes > memory_estimate.estimated_bytes:
+                    components = dict(memory_estimate.components_bytes)
+                    components["operator_supplied_estimate_floor"] = (
+                        estimate_bytes - memory_estimate.estimated_bytes
+                    )
+                    memory_estimate = replace(
+                        memory_estimate,
+                        components_bytes=components,
+                        estimated_bytes=estimate_bytes,
+                    )
+                    self.memory_estimate = memory_estimate
+                estimate = estimate_bytes / 1024**3
+                self.model_memory_estimate_gb = round(estimate, 2)
+                require_memory_capacity(memory_estimate, estimate_bytes=estimate_bytes)
                 log_path = Path(settings.llamacpp_log_file).expanduser()
                 log_path.parent.mkdir(parents=True, exist_ok=True)
                 rotated = log_path.with_suffix(log_path.suffix + ".1")
@@ -332,10 +429,10 @@ class LlamaCppRuntime:
                     stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,
                 )
+                self.last_return_code = None
                 self._attach_log_capture()
                 await self._wait_healthy()
                 self.state = RuntimeState.READY
-                self._stopping = False
                 self._monitor = asyncio.create_task(self._watch(), name="llama-server-supervisor")
             except BaseException as exc:
                 self.state = RuntimeState.FAILED
@@ -347,6 +444,8 @@ class LlamaCppRuntime:
         deadline = asyncio.get_running_loop().time() + settings.llamacpp_startup_timeout_seconds
         async with httpx.AsyncClient(timeout=2, trust_env=False) as client:
             while asyncio.get_running_loop().time() < deadline:
+                if self._stopping:
+                    raise RuntimeError("managed llama-server startup was cancelled by shutdown")
                 if not self.process or self.process.returncode is not None:
                     raise RuntimeError("managed llama-server child exited before becoming healthy")
                 try:
@@ -388,6 +487,9 @@ class LlamaCppRuntime:
             if process is None:
                 return
             code = await process.wait()
+            self.last_return_code = code
+            if not self._stopping:
+                self.state = RuntimeState.FAILED
             if self._log_task:
                 await asyncio.gather(self._log_task, return_exceptions=True)
                 self._log_task = None
@@ -408,16 +510,20 @@ class LlamaCppRuntime:
                 return
             while not self._stopping:
                 try:
-                    self.state = RuntimeState.STARTING
-                    self.process = await asyncio.create_subprocess_exec(
-                        *self.command(),
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.STDOUT,
-                        start_new_session=True,
-                    )
-                    self._attach_log_capture()
-                    await self._wait_healthy()
-                    self.state = RuntimeState.READY
+                    async with self._lock:
+                        if self._stopping:
+                            return
+                        self.state = RuntimeState.STARTING
+                        self.process = await asyncio.create_subprocess_exec(
+                            *self.command(),
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.STDOUT,
+                            start_new_session=True,
+                        )
+                        self.last_return_code = None
+                        self._attach_log_capture()
+                        await self._wait_healthy()
+                        self.state = RuntimeState.READY
                     break
                 except asyncio.CancelledError:
                     raise
@@ -425,7 +531,8 @@ class LlamaCppRuntime:
                     self.state = RuntimeState.FAILED
                     self.last_error = str(exc)
                     logger.exception("unable to restart managed llama-server")
-                    await self._stop_owned_child(close_log=False)
+                    async with self._lock:
+                        await self._stop_owned_child(close_log=False)
                     self.restart_count += 1
                     self._recovery_attempts += 1
                     if self._recovery_attempts > settings.llamacpp_max_restarts:
@@ -437,13 +544,46 @@ class LlamaCppRuntime:
     async def _stop_owned_child(self, *, close_log: bool = True) -> None:
         process = self.process
         self.process = None
+        if process and process.returncode is not None:
+            self.last_return_code = process.returncode
         if process and process.returncode is None:
-            process.terminate()
+            # start_new_session=True gives this supervisor a private process
+            # group. Signal only that owned group so helper descendants cannot
+            # outlive the llama-server child.
+            shutdown_deadline = (
+                asyncio.get_running_loop().time() + settings.shutdown_timeout_seconds
+            )
             try:
-                await asyncio.wait_for(process.wait(), timeout=settings.shutdown_timeout_seconds)
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(
+                    process.wait(),
+                    timeout=max(0.01, shutdown_deadline - asyncio.get_running_loop().time()),
+                )
             except TimeoutError:
-                process.kill()
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 await process.wait()
+            else:
+                # Allow any owned descendants the remaining graceful window,
+                # then force-kill the private group if one is still present.
+                group_alive = True
+                while asyncio.get_running_loop().time() < shutdown_deadline:
+                    try:
+                        os.killpg(process.pid, 0)
+                    except ProcessLookupError:
+                        group_alive = False
+                        break
+                    await asyncio.sleep(0.1)
+                if group_alive:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
         if self._log_task:
             await asyncio.gather(self._log_task, return_exceptions=True)
             self._log_task = None
@@ -452,14 +592,15 @@ class LlamaCppRuntime:
             self._log = None
 
     async def stop(self) -> None:
-        self.state = RuntimeState.STOPPING
         self._stopping = True
-        monitor, self._monitor = self._monitor, None
-        if monitor and monitor is not asyncio.current_task():
-            monitor.cancel()
-            await asyncio.gather(monitor, return_exceptions=True)
-        await self._stop_owned_child()
-        self.state = RuntimeState.STOPPED
+        async with self._lock:
+            self.state = RuntimeState.STOPPING
+            monitor, self._monitor = self._monitor, None
+            if monitor and monitor is not asyncio.current_task():
+                monitor.cancel()
+                await asyncio.gather(monitor, return_exceptions=True)
+            await self._stop_owned_child()
+            self.state = RuntimeState.STOPPED
 
     def status(self) -> dict[str, object]:
         process = self.process
@@ -468,13 +609,28 @@ class LlamaCppRuntime:
             "managed": settings.llamacpp_managed,
             "pid": process.pid if process and process.returncode is None else None,
             "owns_process": bool(process and process.returncode is None),
-            "return_code": process.returncode if process else None,
+            "return_code": process.returncode if process else self.last_return_code,
             "restart_count": self.restart_count,
             "model_id": self.active_model_id,
             "model_path": self.active_model_path if settings.llamacpp_managed else None,
             "context_length": settings.max_context_length,
+            "server_context_capacity": settings.max_context_length * settings.llamacpp_parallel,
             "model_context_capability": self.model_context_capability,
             "estimated_memory_gib": self.model_memory_estimate_gb,
+            "memory_estimate": (
+                {
+                    "kind": "estimated",
+                    "complete": self.memory_estimate.complete,
+                    "estimated_bytes": self.memory_estimate.estimated_bytes,
+                    "headroom_bytes": self.memory_estimate.headroom_bytes,
+                    "capacity_bytes": self.memory_estimate.capacity_bytes,
+                    "components_bytes": self.memory_estimate.components_bytes,
+                    "notes": list(self.memory_estimate.notes),
+                }
+                if self.memory_estimate
+                else None
+            ),
+            "observed_process_rss_bytes": _process_rss_bytes(process),
             "last_error": self.last_error,
             "supported_optional_flags": sorted(
                 flag
@@ -510,3 +666,24 @@ class LlamaCppRuntime:
 
 
 runtime = LlamaCppRuntime()
+
+
+def require_memory_capacity(estimate: MemoryEstimate, *, estimate_bytes: int | None = None) -> None:
+    required = estimate.estimated_bytes if estimate_bytes is None else estimate_bytes
+    if required + estimate.headroom_bytes > estimate.capacity_bytes:
+        raise RuntimeError(
+            "estimated managed runtime memory plus headroom exceeds admission capacity: "
+            f"{required / 1024**3:.2f} GiB estimated + "
+            f"{estimate.headroom_bytes / 1024**3:.2f} GiB headroom > "
+            f"{estimate.capacity_bytes / 1024**3:.2f} GiB capacity; "
+            f"components={estimate.components_bytes}"
+        )
+
+
+def _process_rss_bytes(process: asyncio.subprocess.Process | None) -> int | None:
+    if process is None or process.returncode is not None:
+        return None
+    try:
+        return psutil.Process(process.pid).memory_info().rss
+    except (OSError, psutil.Error):
+        return None

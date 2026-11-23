@@ -13,6 +13,7 @@ class LlamaCppBackend:
     name = "llama.cpp"
 
     def __init__(self) -> None:
+        self._token_count_route_supported: bool | None = None
         timeout = httpx.Timeout(
             settings.backend_http_timeout_seconds,
             connect=min(10.0, settings.backend_http_timeout_seconds),
@@ -53,6 +54,35 @@ class LlamaCppBackend:
         # llama-server serves exactly one model. Its OpenAI model catalog is
         # the authoritative loaded model identity (including configured alias).
         return await self.available_models()
+
+    async def count_chat_tokens(self, model: str, payload: dict[str, Any]) -> int | None:
+        """Ask llama-server to count its rendered chat prompt, when supported."""
+        if not settings.llamacpp_base_url:
+            return None
+        if self._token_count_route_supported is False:
+            return None
+        body = dict(payload)
+        body.pop("num_ctx", None)
+        body["model"] = model
+        try:
+            response = await self._client.post(
+                f"{settings.llamacpp_base_url}/v1/chat/completions/input_tokens",
+                json=body,
+                timeout=3,
+            )
+            response.raise_for_status()
+            data = response.json()
+            count = data.get("tokens", data.get("prompt_tokens"))
+            self._token_count_route_supported = True
+            return int(count) if isinstance(count, int) and count >= 0 else None
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in {404, 405, 501}:
+                self._token_count_route_supported = False
+            return None
+        except (httpx.HTTPError, ValueError, TypeError):
+            # Older llama-server versions do not expose this route. Fall back
+            # to the explicitly estimated admission path without failing chat.
+            return None
 
     async def embeddings(self, model: str, inputs: list[str]) -> list[list[float]]:
         if not settings.llamacpp_base_url:

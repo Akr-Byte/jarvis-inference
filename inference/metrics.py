@@ -79,11 +79,12 @@ CPU_PERCENT = Gauge("inference_host_cpu_percent", "Host CPU utilization percenta
 RUNTIME_STATE = Gauge("inference_runtime_state", "Managed engine lifecycle state.", ["state"])
 RUNTIME_RESTARTS = Counter("inference_runtime_restarts_total", "Managed runtime restarts.")
 RUNTIME_MEMORY_ESTIMATE = Gauge(
-    "inference_runtime_estimated_memory_gib", "Estimated managed model plus KV memory in GiB."
+    "inference_runtime_estimated_memory_gib",
+    "Estimated managed runtime memory in GiB; not observed process consumption.",
 )
 CONTEXT_USAGE = Histogram(
     "inference_context_usage_ratio",
-    "Estimated prompt plus output budget / context window.",
+    "Estimated or tokenizer-counted prompt plus output budget / context window.",
     ["model"],
 )
 _reported_runtime_restarts = 0

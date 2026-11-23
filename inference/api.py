@@ -159,7 +159,11 @@ async def embeddings(
                 for index, vector in enumerate(vectors)
             ],
             "model": model,
-            "usage": {"prompt_tokens": estimated_tokens, "total_tokens": estimated_tokens},
+            "usage": {
+                "prompt_tokens": estimated_tokens,
+                "total_tokens": estimated_tokens,
+                "prompt_tokens_estimated": True,
+            },
         },
         headers={"X-Request-ID": request_id},
     )
