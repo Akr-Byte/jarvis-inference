@@ -122,6 +122,12 @@ class ModelManager:
                 self._loaded.add(model)
             self._last_load[model] = self._last_load.get(model, now)
 
+    def record_unloaded(self, model: str) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._loaded.discard(model)
+            self._last_unload[model] = now
+
     def status(self) -> dict[str, object]:
         with self._lock:
             loaded = sorted(self._loaded)

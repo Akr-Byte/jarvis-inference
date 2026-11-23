@@ -19,6 +19,7 @@ from inference.metrics import (
     BACKEND_ERRORS,
     CANCELLED_REQUESTS,
     CIRCUIT_STATE,
+    CONTEXT_USAGE,
     GENERATION_DURATION,
     LATENCY,
     MODEL_LOAD,
@@ -64,14 +65,28 @@ def _check_context_window(payload: dict[str, Any]) -> None:
     effective = (
         int(requested_context) if requested_context is not None else settings.max_context_length
     )
+    requested_output = payload.get("max_tokens")
+    output_budget = (
+        int(requested_output) if requested_output is not None else settings.max_output_tokens
+    )
+    if output_budget > settings.max_output_tokens:
+        raise InferenceError(
+            "OUTPUT_LIMIT_EXCEEDED",
+            f"max_tokens cannot exceed the configured limit of {settings.max_output_tokens}",
+            False,
+            400,
+        )
     messages = payload.get("messages", [])
     estimated = (len(json.dumps(messages).encode("utf-8")) + 2) // 3
-    if estimated > effective:
+    CONTEXT_USAGE.labels(model=str(payload.get("model") or settings.default_model)).observe(
+        (estimated + output_budget) / effective
+    )
+    if estimated + output_budget > effective:
         raise InferenceError(
             "CONTEXT_LIMIT_EXCEEDED",
-            f"estimated prompt size {estimated} tokens exceeds the "
-            f"{effective} token context window; shorten the conversation or "
-            "raise MAX_CONTEXT_LENGTH",
+            f"estimated prompt ({estimated} tokens) plus output budget ({output_budget} tokens) "
+            f"exceeds the {effective} token context window; shorten the conversation or "
+            "adjust MAX_CONTEXT_LENGTH/MAX_OUTPUT_TOKENS",
             False,
             400,
         )
@@ -86,6 +101,7 @@ class Scheduler:
         self._active: dict[str, dict[str, Any]] = {}
         self._request_counter = 0
         self._sweeper_task: asyncio.Task[None] | None = None
+        self._runtime_maintenance = False
         self._circuits = {
             "ollama": CircuitBreaker(
                 settings.circuit_failure_threshold,
@@ -101,7 +117,7 @@ class Scheduler:
 
     @property
     def backend(self) -> OllamaBackend | LlamaCppBackend:
-        return self._llama if settings.llamacpp_url else self._ollama
+        return self._llama if settings.llamacpp_base_url else self._ollama
 
     @property
     def circuit(self) -> CircuitBreaker:
@@ -118,6 +134,13 @@ class Scheduler:
         return f"inf-{self._request_counter:08d}"
 
     def _enqueue(self) -> None:
+        if self._runtime_maintenance:
+            raise InferenceError(
+                "RUNTIME_MAINTENANCE",
+                "The inference runtime is being changed; retry shortly",
+                True,
+                503,
+            )
         try:
             self._queue.put_nowait(object())
         except asyncio.QueueFull as exc:
@@ -285,6 +308,13 @@ class Scheduler:
     async def embeddings(
         self, model: str, inputs: list[str], request_id: str | None = None
     ) -> list[list[float]]:
+        if self.backend.name == "llama.cpp" and not settings.llamacpp_embeddings:
+            raise InferenceError(
+                "CAPABILITY_UNSUPPORTED",
+                "The configured llama.cpp runtime does not enable embeddings",
+                False,
+                400,
+            )
         model_manager.validate(model)
         if model != settings.embedding_model:
             raise InferenceError(
@@ -376,6 +406,8 @@ class Scheduler:
         model = str(payload.get("model") or settings.default_model)
         model_manager.validate_chat(model)
         _check_context_window(payload)
+        payload = dict(payload)
+        payload.setdefault("max_tokens", settings.max_output_tokens)
         request_id = request_id or self._new_request_id()
         self._enqueue()
         enqueued = time.perf_counter()
@@ -461,6 +493,8 @@ class Scheduler:
         model = str(payload.get("model") or settings.default_model)
         model_manager.validate_chat(model)
         _check_context_window(payload)
+        payload = dict(payload)
+        payload.setdefault("max_tokens", settings.max_output_tokens)
         request_id = request_id or self._new_request_id()
         self._enqueue()
         enqueued = time.perf_counter()
@@ -524,6 +558,8 @@ class Scheduler:
         self, payload: dict[str, Any], lease: StreamLease
     ) -> AsyncIterator[str]:
         model = lease.model
+        payload = dict(payload)
+        payload.setdefault("max_tokens", settings.max_output_tokens)
         started: float | None = None
         first_token: float | None = None
         try:
@@ -635,10 +671,21 @@ class Scheduler:
             "available_slots": getattr(self._semaphore, "_value", None),
             "queue_timeout_seconds": settings.queue_timeout_seconds,
             "backend": self.backend.name,
+            "runtime_maintenance": self._runtime_maintenance,
             "active_requests": active,
             "circuit": self.circuit.status(),
             **model_manager.status(),
         }
+
+    def begin_runtime_maintenance(self) -> bool:
+        """Block new admissions and reserve lifecycle operations when idle."""
+        if self._runtime_maintenance or self._active or not self._queue.empty():
+            return False
+        self._runtime_maintenance = True
+        return True
+
+    def end_runtime_maintenance(self) -> None:
+        self._runtime_maintenance = False
 
     async def readiness(self) -> dict[str, Any]:
         backend_ok = await self.backend.health()
@@ -648,7 +695,9 @@ class Scheduler:
         if not refreshed:
             return {"ready": False, "reason": "model_state_unavailable"}
         state = model_manager.status()
-        configured = set(settings.inference_models)
+        configured = set(settings.models)
+        if self.backend.name == "ollama" or settings.llamacpp_embeddings:
+            configured.add(settings.embedding_model)
         available = set(state["available_models"])
         missing = sorted(configured - available)
         if missing:

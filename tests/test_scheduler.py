@@ -7,7 +7,7 @@ from inference.config import settings
 from inference.errors import InferenceError
 from inference.metrics import ACTIVE_MODEL
 from inference.models import model_manager
-from inference.scheduler import Scheduler
+from inference.scheduler import Scheduler, _check_context_window
 
 
 class FakeBackend:
@@ -565,3 +565,51 @@ async def test_openai_style_stream_completes_without_stream_incomplete(
 
     assert lines[-1] == "[DONE]"
     assert scheduler.status()["queue_depth"] == 0
+
+
+def test_context_admission_supports_128k_and_reserves_output(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "max_context_length", 131072)
+    monkeypatch.setattr(settings, "max_output_tokens", 8192)
+
+    _check_context_window(
+        {
+            "model": "qwen3:1.7b",
+            "messages": [{"role": "user", "content": "x" * 90000}],
+            "num_ctx": 131072,
+            "max_tokens": 8192,
+        }
+    )
+    with pytest.raises(InferenceError, match=r"prompt \("):
+        _check_context_window(
+            {
+                "model": "qwen3:1.7b",
+                "messages": [{"role": "user", "content": "x" * 400000}],
+                "num_ctx": 131072,
+                "max_tokens": 8192,
+            }
+        )
+
+
+def test_runtime_maintenance_blocks_inference_admission() -> None:
+    scheduler = Scheduler()
+    assert scheduler.begin_runtime_maintenance()
+    with pytest.raises(InferenceError) as caught:
+        scheduler._enqueue()
+    assert caught.value.code == "RUNTIME_MAINTENANCE"
+    scheduler.end_runtime_maintenance()
+    scheduler._enqueue()
+    assert scheduler.status()["queue_depth"] == 1
+
+
+@pytest.mark.asyncio
+async def test_llamacpp_embeddings_require_explicit_capability(monkeypatch) -> None:
+    scheduler = Scheduler()
+    monkeypatch.setattr(settings, "llamacpp_url", "http://llama")
+    monkeypatch.setattr(settings, "llamacpp_managed", False)
+    monkeypatch.setattr(settings, "llamacpp_embeddings", False)
+
+    with pytest.raises(InferenceError) as caught:
+        await scheduler.embeddings(settings.embedding_model, ["hello"])
+
+    assert caught.value.code == "CAPABILITY_UNSUPPORTED"
+    await scheduler.close()

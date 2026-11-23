@@ -76,15 +76,40 @@ MEMORY_BUDGET = Gauge(
     "inference_memory_budget_gib", "Configured model admission memory budget in GiB."
 )
 CPU_PERCENT = Gauge("inference_host_cpu_percent", "Host CPU utilization percentage.")
+RUNTIME_STATE = Gauge("inference_runtime_state", "Managed engine lifecycle state.", ["state"])
+RUNTIME_RESTARTS = Counter("inference_runtime_restarts_total", "Managed runtime restarts.")
+RUNTIME_MEMORY_ESTIMATE = Gauge(
+    "inference_runtime_estimated_memory_gib", "Estimated managed model plus KV memory in GiB."
+)
+CONTEXT_USAGE = Histogram(
+    "inference_context_usage_ratio",
+    "Estimated prompt plus output budget / context window.",
+    ["model"],
+)
+_reported_runtime_restarts = 0
 
 
 def render() -> bytes:
+    global _reported_runtime_restarts
     resources = resource_status()
     HOST_MEMORY_AVAILABLE.set(float(resources["host_memory_available_gb"]))
     CONTAINER_MEMORY_AVAILABLE.set(float(resources["container_memory_available_gb"]))
     ADMISSION_MEMORY_AVAILABLE.set(float(resources["admission_memory_available_gb"]))
     MEMORY_BUDGET.set(float(resources["memory_budget_gb"]))
     CPU_PERCENT.set(float(resources["cpu_percent"]))
+    from inference.llamacpp_runtime import RuntimeState, runtime
+
+    runtime_status = runtime.status()
+    for state in RuntimeState:
+        RUNTIME_STATE.labels(state=state.value).set(
+            1 if runtime_status["state"] == state.value else 0
+        )
+    restart_delta = int(runtime_status["restart_count"]) - _reported_runtime_restarts
+    if restart_delta > 0:
+        RUNTIME_RESTARTS.inc(restart_delta)
+        _reported_runtime_restarts += restart_delta
+    if runtime_status["estimated_memory_gib"] is not None:
+        RUNTIME_MEMORY_ESTIMATE.set(float(runtime_status["estimated_memory_gib"]))
     state = model_manager.status()
     warm = set(state["warm_models"])
     for model in state["configured_models"]:

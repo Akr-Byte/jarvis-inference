@@ -11,6 +11,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from inference.api import router
 from inference.config import settings, validate_security_config
+from inference.llamacpp_runtime import runtime
 from inference.scheduler import scheduler
 
 
@@ -67,12 +68,15 @@ class BodyLimitMiddleware(BaseHTTPMiddleware):
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     validate_security_config()
+    if settings.llamacpp_managed:
+        await runtime.start()
     scheduler.start_sweeper()
     yield
     try:
         await asyncio.wait_for(scheduler.close(), timeout=settings.shutdown_timeout_seconds)
     except TimeoutError:
         pass
+    await runtime.stop()
 
 
 def _app_version() -> str:

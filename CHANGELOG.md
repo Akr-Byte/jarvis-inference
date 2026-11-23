@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Optional native `llama-server` supervision with ownership/PID reporting, health gating, bounded
+  restart recovery, graceful shutdown, live log rotation, and version-probed optional flags.
+- GGUF metadata inspection, complete split-shard discovery, explicit model maps, model lifecycle
+  endpoints, runtime capabilities, context/output admission, and estimated weights-plus-KV memory
+  checks for managed local runtimes.
+- Workstation and constrained homelab environment profiles. Existing Ollama defaults remain in
+  place.
+
 ## 0.5.1
 
 ### Fixed

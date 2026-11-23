@@ -28,7 +28,7 @@ async def test_llamacpp_models(monkeypatch) -> None:
     backend._client = Client()
 
     assert await backend.available_models() == ["qwen3:1.7b"]
-    assert await backend.loaded_models() == []
+    assert await backend.loaded_models() == ["qwen3:1.7b"]
 
 
 @pytest.mark.asyncio

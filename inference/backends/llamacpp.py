@@ -28,19 +28,19 @@ class LlamaCppBackend:
         await self._client.aclose()
 
     async def health(self) -> bool:
-        if not settings.llamacpp_url:
+        if not settings.llamacpp_base_url:
             return False
         try:
-            response = await self._client.get(f"{settings.llamacpp_url}/health", timeout=3)
+            response = await self._client.get(f"{settings.llamacpp_base_url}/health", timeout=3)
             return 200 <= response.status_code < 300
         except httpx.HTTPError:
             return False
 
     async def available_models(self) -> list[str]:
-        if not settings.llamacpp_url:
+        if not settings.llamacpp_base_url:
             return []
         try:
-            response = await self._client.get(f"{settings.llamacpp_url}/v1/models", timeout=3)
+            response = await self._client.get(f"{settings.llamacpp_base_url}/v1/models", timeout=3)
             response.raise_for_status()
         except httpx.HTTPError:
             # An unreachable backend must degrade to an empty catalog (the
@@ -50,16 +50,18 @@ class LlamaCppBackend:
         return [str(item["id"]) for item in response.json().get("data", [])]
 
     async def loaded_models(self) -> list[str]:
-        return []
+        # llama-server serves exactly one model. Its OpenAI model catalog is
+        # the authoritative loaded model identity (including configured alias).
+        return await self.available_models()
 
     async def embeddings(self, model: str, inputs: list[str]) -> list[list[float]]:
-        if not settings.llamacpp_url:
+        if not settings.llamacpp_base_url:
             raise InferenceError(
                 "BACKEND_NOT_CONFIGURED", "llama.cpp is not configured", False, 503
             )
         try:
             response = await self._client.post(
-                f"{settings.llamacpp_url}/v1/embeddings",
+                f"{settings.llamacpp_base_url}/v1/embeddings",
                 json={"model": model, "input": inputs},
             )
             response.raise_for_status()
@@ -81,15 +83,16 @@ class LlamaCppBackend:
             raise InferenceError("BACKEND_UNAVAILABLE", str(exc), True, 503) from exc
 
     async def chat(self, model: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if not settings.llamacpp_url:
+        if not settings.llamacpp_base_url:
             raise InferenceError(
                 "BACKEND_NOT_CONFIGURED", "llama.cpp is not configured", False, 503
             )
         body = dict(payload)
+        body.pop("num_ctx", None)  # Runtime context is configured at process launch.
         body["model"] = model
         try:
             response = await self._client.post(
-                f"{settings.llamacpp_url}/v1/chat/completions", json=body
+                f"{settings.llamacpp_base_url}/v1/chat/completions", json=body
             )
             response.raise_for_status()
         except httpx.TimeoutException as exc:
@@ -107,16 +110,17 @@ class LlamaCppBackend:
         return response.json()
 
     async def stream(self, model: str, payload: dict[str, Any]) -> AsyncIterator[str]:
-        if not settings.llamacpp_url:
+        if not settings.llamacpp_base_url:
             raise InferenceError(
                 "BACKEND_NOT_CONFIGURED", "llama.cpp is not configured", False, 503
             )
         body = dict(payload)
+        body.pop("num_ctx", None)
         body["model"] = model
         body["stream"] = True
         try:
             async with self._client.stream(
-                "POST", f"{settings.llamacpp_url}/v1/chat/completions", json=body
+                "POST", f"{settings.llamacpp_base_url}/v1/chat/completions", json=body
             ) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():

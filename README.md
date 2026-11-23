@@ -45,8 +45,9 @@ local model backend (Ollama, or an optional llama.cpp server) and speaks the Ope
 
 ## Overview
 
-`jarvis-inference` is a production-grade, CPU-only inference gateway for small local language
-models. It exposes an OpenAI-compatible API:
+`jarvis-inference` is a local inference gateway and runtime supervisor. It exposes an
+OpenAI-compatible API while keeping model policy, admission and process lifecycle outside the
+inference engine:
 
 - `POST /v1/chat/completions` — chat completions with optional streaming (SSE), tool calls and
   reasoning content.
@@ -54,6 +55,11 @@ models. It exposes an OpenAI-compatible API:
 - `GET /v1/models` — model listing for the configured registry.
 - `GET /v1/capabilities` — capability advertisement for clients.
 - `GET /v1/inference/status` — in-process inference/runtime status.
+- `GET /v1/runtime/status` and `/v1/runtime/capabilities` — authenticated engine process state and
+  probed llama.cpp options.
+- `GET /v1/model-registry` and `GET /v1/models/{id}` — authenticated discovered, registered,
+  available and loaded model metadata.
+- `POST /v1/models/{id}/load` and `/unload` — authenticated idle-only managed model lifecycle.
 - `GET /health` and `GET /ready` — liveness and readiness probes.
 - `GET /metrics` — Prometheus metrics.
 
@@ -80,14 +86,21 @@ Jarvis CLI (local agent)           AI Stack (optional remote control plane)
                              v
                      jarvis-inference
                      OpenAI-compatible API
-                             |
-                           Ollama
+                       /            \
+              Ollama adapter    llama.cpp adapter
+                                    |
+                         managed or external process
 ```
 
 The dedicated inference VM owns model execution. Jarvis and AI Stack are independent sibling
 consumers of the gateway; neither consumer runs Ollama or LiteLLM. Jarvis local execution must remain
 usable when AI Stack is stopped. The gateway owns the model allowlist, bounded queue, concurrency,
 backend timeouts and resource limits.
+
+Ollama remains an inference engine with its own model store and lifecycle. llama.cpp supplies the
+GGUF runtime and optimized kernels; in native managed mode Jarvis starts and supervises its
+`llama-server` process while leaving tensor execution and KV/prompt caching inside llama.cpp.
+External llama-server and Ollama workflows remain supported through independent HTTP adapters.
 
 ## Quick start
 
@@ -148,7 +161,8 @@ surface). Highlights:
 | `MAX_CONCURRENT_REQUESTS` | `1` | Active inference slots. |
 | `MAX_QUEUE_SIZE` | `8` | Waiting requests; the active generation is tracked separately. |
 | `MAX_LOADED_MODELS` | `1` | Backend-side loaded models. |
-| `MEMORY_BUDGET_GB` / `MEMORY_HEADROOM_GB` | `10` / `1.0` | Gateway memory budget and headroom. |
+| `MEMORY_BUDGET_GB` / `MEMORY_HEADROOM_GB` | `10` / `1.0` | Runtime/admission RAM budget and safety headroom. |
+| `MODEL_MEMORY_ESTIMATE_GB` | `0` | Optional operator supplied minimum model/runtime memory estimate; `0` uses GGUF weights plus calculated KV. |
 | `BACKEND_HTTP_TIMEOUT_SECONDS` | `600` | Backend (Ollama/llama.cpp) request timeout. |
 | `QUEUE_TIMEOUT_SECONDS` | `90` | Waiting time before an unslotted request is rejected. |
 | `EMBEDDING_TIMEOUT_SECONDS` | `30` | Embedding request timeout. |
@@ -159,8 +173,19 @@ surface). Highlights:
 | `CIRCUIT_FAILURE_THRESHOLD` / `CIRCUIT_RECOVERY_SECONDS` | `3` / `15` | Circuit breaker thresholds. |
 | `OLLAMA_URL` | `http://ollama:11434` | Backend base URL. |
 | `LLAMACPP_URL` | *(empty)* | Optional llama.cpp backend URL. |
+| `LLAMACPP_MANAGED` | `false` | Launch and supervise a local llama-server child. |
+| `LLAMACPP_MODEL` / `LLAMACPP_ALIAS` | *(empty)* | GGUF file or first split shard, and public model ID. |
+| `LLAMACPP_MODEL_MAP` | *(empty)* | Optional `id=/path/model.gguf;id2=/path/other.gguf` profiles for managed model switching. |
+| `MODEL_DIRECTORY` | `~/models` | Root recursively scanned for GGUFs and complete split sets. |
+| `LLAMACPP_THREADS` / `LLAMACPP_BATCH_SIZE` / `LLAMACPP_UBATCH_SIZE` | `8` / `512` / `128` | llama.cpp CPU and batch tuning. |
+| `LLAMACPP_BATCH_THREADS` / `LLAMACPP_PARALLEL` | `8` / `1` | Batch CPU threads and llama-server slots. |
+| `LLAMACPP_CACHE_PROMPT` / `LLAMACPP_CACHE_RAM_MIB` | `true` / `0` | Prompt-cache switch and optional RAM bound. |
+| `LLAMACPP_CACHE_TYPE_K` / `LLAMACPP_CACHE_TYPE_V` | *(empty)* | Optional quantized KV cache types. |
+| `LLAMACPP_EMBEDDINGS` | `false` | Enable llama.cpp embedding mode only when the configured model/profile supports it. Ollama embeddings stay enabled by default. |
+| `LLAMACPP_RESTART_ENABLED` / `LLAMACPP_MAX_RESTARTS` | `true` / `5` | Bounded recovery after unexpected child exits. |
 | `OLLAMA_KEEP_ALIVE` | `30m` | Backend model residency. |
 | `MAX_CONTEXT_LENGTH` | `8192` | Hard context cap applied before queue admission. |
+| `MAX_OUTPUT_TOKENS` | `2048` | Default and maximum configured output budget; prompt plus output must fit context. |
 | `MAX_EMBEDDING_BATCH_SIZE` | `64` | Inputs per embedding batch. |
 | `INFERENCE_CPUS` / `INFERENCE_MEMORY_LIMIT` | `0.4` / `1g` | Gateway container CPU/memory caps (constrained-host profile). |
 | `OLLAMA_CPUS` / `OLLAMA_MEMORY_LIMIT` | `1.5` / `8g` | Backend container CPU/memory caps (constrained-host profile). |
@@ -168,6 +193,71 @@ surface). Highlights:
 
 `MAX_REQUEST_BODY_MIB` (default `8`) bounds request-body size and is enforced before validation;
 prompts that do not fit the effective context are rejected with `CONTEXT_LIMIT_EXCEEDED` at admission.
+
+### Native Linux llama.cpp workstation
+
+Install the build tools and OpenBLAS on Ubuntu, then build llama.cpp’s official server target:
+
+```sh
+sudo apt update
+sudo apt install -y build-essential cmake git libopenblas-dev
+git clone https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
+cmake -S /tmp/llama.cpp -B /tmp/llama.cpp/build -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS
+cmake --build /tmp/llama.cpp/build --config Release --target llama-server -j "$(nproc)"
+sudo install -m 0755 /tmp/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
+```
+
+The official [llama.cpp build guide](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
+documents CPU/BLAS options. Copy
+`.env.workstation.example` to `.env`, set `LLAMACPP_MODEL` to a local GGUF file, choose a model
+alias and tune the memory/context values to fit the workstation. For split GGUFs, point the model
+path at the first shard (the `...00001-of-....gguf` file); llama.cpp resolves the sibling shards.
+
+Install and launch the gateway natively:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e .
+set -a
+. .env
+set +a
+uvicorn inference.main:app --host "$INFERENCE_HOST" --port "$INFERENCE_PORT"
+```
+
+With `LLAMACPP_MANAGED=true`, the gateway starts only the child process it created, sends its
+output to `LLAMACPP_LOG_FILE`, checks `/health` before serving, restarts that child after an
+unexpected exit up to `LLAMACPP_MAX_RESTARTS`, and terminates that child during shutdown. It probes
+the executable's `--help` output before using optional flags. Startup reads GGUF context and KV
+metadata and rejects contexts beyond the model's training limit or estimated memory beyond the
+configured budget and headroom. Missing KV or trained-context metadata is rejected above 32K
+context rather than treated as safe. It never discovers, adopts or signals an independently started `llama-server`.
+Leave `LLAMACPP_MANAGED=false` and set `LLAMACPP_URL` to use an externally supervised server. The
+default Ollama deployment remains unchanged.
+
+For multiple manually registered GGUFs, configure `LLAMACPP_MODEL_MAP` with semicolon-separated
+`public-id=/path/to/model.gguf` pairs and set `MODEL_REGISTRY`/`DEFAULT_MODEL` accordingly. Runtime
+switching is serialized and rejected while requests are active or queued. Authenticated operators
+can inspect `/v1/model-registry`, `/v1/runtime/status`, `/v1/runtime/capabilities`, and
+`/v1/models/{id}`; load and unload use `POST /v1/models/{id}/load` and `/unload`. Discovery reports
+on-disk models separately from registered, available and loaded models. Optional flags and cache
+telemetry are reported honestly; cache hit counts are not inferred.
+
+Example OpenAI-compatible client settings use base URL `http://127.0.0.1:8080/v1`, the model ID
+from `MODEL_REGISTRY`, and `INFERENCE_API_KEY` as the API key. For a direct smoke check:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $INFERENCE_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"workstation-model","messages":[{"role":"user","content":"Reply with OK"}],"max_tokens":32}'
+```
+
+The constrained Ollama example is [.env.constrained-homelab.example](.env.constrained-homelab.example).
+It keeps 8K context, one active generation and the existing Ollama backend. The installer creates
+`.env` only when absent, so upgrades do not overwrite user configuration; keep a backup of `.env`
+before editing it. For rollback, restore the previous revision and `.env`, then run
+`bash scripts/install.sh`; the Ollama model volume is preserved.
 
 ## Production and constrained-host profiles
 

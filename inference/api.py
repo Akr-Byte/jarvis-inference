@@ -9,6 +9,7 @@ import struct
 import time
 import uuid
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -16,7 +17,9 @@ from starlette.background import BackgroundTask
 
 from inference.config import settings
 from inference.errors import InferenceError
+from inference.llamacpp_runtime import runtime
 from inference.metrics import render
+from inference.model_registry import model_details, registry_status
 from inference.models import model_manager
 from inference.resources import status as resource_status
 from inference.scheduler import StreamLease, scheduler
@@ -181,17 +184,19 @@ async def capabilities(
     models = []
     for model in chat_models:
         models.append({"id": model, "capabilities": ["chat", "streaming"]})
-    models.append({"id": settings.embedding_model, "capabilities": ["embeddings"]})
+    embeddings_enabled = scheduler.backend.name == "ollama" or (
+        settings.llamacpp_embeddings
+        and (not settings.llamacpp_managed or runtime.capabilities()["embeddings"] is True)
+    )
+    if embeddings_enabled:
+        models.append({"id": settings.embedding_model, "capabilities": ["embeddings"]})
+    features = ["chat", "streaming", "model_catalog", "request_ids"]
+    if embeddings_enabled:
+        features.append("embeddings")
     return {
         "protocol": {"current": 1, "min_client": 1, "max_client": 1},
         "service": "jarvis-inference",
-        "features": [
-            "chat",
-            "streaming",
-            "embeddings",
-            "model_catalog",
-            "request_ids",
-        ],
+        "features": features,
         "limitations": [
             "tool_choice is tolerated but not enforced by the backend "
             "(only tool_choice=none is applied, by stripping the tools)"
@@ -213,7 +218,149 @@ async def inference_status(
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
     _auth(_bearer(authorization))
-    return {"runtime": scheduler.status(), "resources": resource_status()}
+    return {
+        "runtime": scheduler.status(),
+        "engine_runtime": runtime.status(),
+        "model_registry": registry_status(),
+        "resources": resource_status(),
+    }
+
+
+@router.get("/v1/runtime/status")
+async def runtime_status(authorization: str | None = Header(default=None)) -> dict[str, object]:
+    _auth(_bearer(authorization))
+    return {"runtime": runtime.status(), "scheduler": scheduler.status()}
+
+
+@router.get("/v1/runtime/capabilities")
+async def runtime_capabilities(
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    _auth(_bearer(authorization))
+    return runtime.capabilities()
+
+
+@router.get("/v1/model-registry")
+async def model_registry_status(
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    _auth(_bearer(authorization))
+    return registry_status()
+
+
+@router.get("/v1/models/{model_id}")
+async def model_metadata(model_id: str, authorization: str | None = Header(default=None)) -> object:
+    _auth(_bearer(authorization))
+    details = model_details(model_id)
+    if details is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": "UNKNOWN_MODEL", "message": f"Unknown model '{model_id}'"}},
+        )
+    return details
+
+
+@router.get("/v1/models/{model_id}/status")
+async def model_runtime_status(
+    model_id: str, authorization: str | None = Header(default=None)
+) -> object:
+    _auth(_bearer(authorization))
+    details = model_details(model_id)
+    if details is None:
+        return JSONResponse(status_code=404, content={"error": {"code": "UNKNOWN_MODEL"}})
+    return {
+        key: details[key]
+        for key in ("id", "registered", "available", "loaded", "accepting_requests", "enabled")
+    }
+
+
+async def _model_lifecycle(model_id: str, load: bool) -> object:
+    details = model_details(model_id)
+    if details is None or not details["registered"]:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "code": "UNKNOWN_MODEL",
+                    "message": f"Model '{model_id}' is not registered",
+                }
+            },
+        )
+    if not settings.llamacpp_managed:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "LIFECYCLE_UNSUPPORTED",
+                    "message": "Model lifecycle control requires managed llama.cpp mode",
+                }
+            },
+        )
+    configured_ids = set(settings.llamacpp_model_map)
+    default_id = settings.llamacpp_alias or Path(settings.llamacpp_model).expanduser().stem
+    default_id = re.sub(r"-\d{5}-of-\d{5}$", "", default_id)
+    if model_id != default_id and model_id not in configured_ids:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "MODEL_PROFILE_UNAVAILABLE",
+                    "message": "This model has no configured managed runtime profile",
+                }
+            },
+        )
+    if not scheduler.begin_runtime_maintenance():
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "MODEL_BUSY",
+                    "message": "Wait for active and queued requests to finish before changing runtime state",
+                }
+            },
+        )
+    try:
+        if load:
+            current_id = runtime.active_model_id
+            if runtime.process and runtime.process.returncode is None and current_id != model_id:
+                await runtime.stop()
+                if current_id:
+                    model_manager.record_unloaded(current_id)
+            await runtime.start(model_id)
+            await model_manager.refresh(scheduler.backend, force=True)
+            return {"id": model_id, "loaded": True, "runtime": runtime.status()}
+        if runtime.active_model_id != model_id:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "MODEL_NOT_LOADED",
+                        "message": "The requested model is not the active runtime model",
+                    }
+                },
+            )
+        await runtime.stop()
+        model_manager.record_unloaded(model_id)
+        return {"id": model_id, "loaded": False, "runtime": runtime.status()}
+    except (RuntimeError, OSError) as exc:
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"code": "RUNTIME_LIFECYCLE_FAILED", "message": str(exc)}},
+        )
+    finally:
+        scheduler.end_runtime_maintenance()
+
+
+@router.post("/v1/models/{model_id}/load")
+async def load_model(model_id: str, authorization: str | None = Header(default=None)) -> object:
+    _auth(_bearer(authorization))
+    return await _model_lifecycle(model_id, load=True)
+
+
+@router.post("/v1/models/{model_id}/unload")
+async def unload_model(model_id: str, authorization: str | None = Header(default=None)) -> object:
+    _auth(_bearer(authorization))
+    return await _model_lifecycle(model_id, load=False)
 
 
 @router.get("/metrics", response_class=PlainTextResponse)

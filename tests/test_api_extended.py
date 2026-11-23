@@ -40,6 +40,35 @@ def test_inference_status() -> None:
     assert "resources" in response.json()
 
 
+def test_management_endpoints_require_existing_auth(monkeypatch) -> None:
+    from inference.config import settings
+
+    monkeypatch.setattr(settings, "api_key", "management-secret")
+    monkeypatch.setattr(settings, "allow_insecure_no_auth", False)
+    client = TestClient(app)
+
+    assert client.get("/v1/runtime/status").status_code == 401
+    assert (
+        client.get(
+            "/v1/runtime/status", headers={"Authorization": "Bearer management-secret"}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.get(
+            "/v1/runtime/capabilities", headers={"Authorization": "Bearer management-secret"}
+        ).status_code
+        == 200
+    )
+    assert client.get("/v1/model-registry").status_code == 401
+    assert (
+        client.get(
+            "/v1/model-registry", headers={"Authorization": "Bearer management-secret"}
+        ).status_code
+        == 200
+    )
+
+
 def test_request_id_is_preserved(monkeypatch) -> None:
     captured: dict = {}
 

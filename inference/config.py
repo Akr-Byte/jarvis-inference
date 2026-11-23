@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 def _int(name: str, default: int) -> int:
@@ -14,6 +16,32 @@ def _float(name: str, default: float) -> float:
 
 def _csv(name: str, default: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in os.getenv(name, default).split(",") if item.strip())
+
+
+def _model_id_from_path(value: str) -> str:
+    stem = Path(value).expanduser().stem
+    return re.sub(r"-\d{5}-of-\d{5}$", "", stem)
+
+
+def _default_model() -> str:
+    configured = os.getenv("DEFAULT_MODEL", "").strip()
+    if configured:
+        return configured
+    mapped = next(
+        (
+            entry.split("=", 1)[0].strip()
+            for entry in os.getenv("LLAMACPP_MODEL_MAP", "").split(";")
+            if "=" in entry
+        ),
+        "",
+    )
+    if mapped:
+        return mapped
+    alias = os.getenv("LLAMACPP_ALIAS", "").strip()
+    if alias:
+        return alias
+    model_path = os.getenv("LLAMACPP_MODEL", "").strip()
+    return _model_id_from_path(model_path) if model_path else "qwen3:1.7b"
 
 
 @dataclass
@@ -41,6 +69,9 @@ class Settings:
     )
     memory_headroom_gb: float = field(
         default_factory=lambda: max(1.0, _float("MEMORY_HEADROOM_GB", 1.0))
+    )
+    model_memory_estimate_gb: float = field(
+        default_factory=lambda: max(0.0, _float("MODEL_MEMORY_ESTIMATE_GB", 0.0))
     )
     backend_http_timeout_seconds: float = field(
         default_factory=lambda: max(
@@ -81,7 +112,7 @@ class Settings:
     circuit_trial_timeout_seconds: float = field(
         default_factory=lambda: max(1.0, _float("CIRCUIT_TRIAL_TIMEOUT_SECONDS", 60.0))
     )
-    default_model: str = field(default_factory=lambda: os.getenv("DEFAULT_MODEL", "qwen3:1.7b"))
+    default_model: str = field(default_factory=_default_model)
     embedding_model: str = field(
         default_factory=lambda: os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
     )
@@ -89,6 +120,77 @@ class Settings:
         default_factory=lambda: os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
     )
     llamacpp_url: str = field(default_factory=lambda: os.getenv("LLAMACPP_URL", "").rstrip("/"))
+    llamacpp_managed: bool = field(
+        default_factory=lambda: (
+            os.getenv("LLAMACPP_MANAGED", "false").strip().lower() in {"1", "true", "yes"}
+        )
+    )
+    llamacpp_server: str = field(
+        default_factory=lambda: os.getenv("LLAMACPP_SERVER", "llama-server")
+    )
+    llamacpp_model: str = field(default_factory=lambda: os.getenv("LLAMACPP_MODEL", ""))
+    llamacpp_model_map_raw: str = field(default_factory=lambda: os.getenv("LLAMACPP_MODEL_MAP", ""))
+    model_directory: Path = field(
+        default_factory=lambda: Path(os.getenv("MODEL_DIRECTORY", "~/models")).expanduser()
+    )
+    llamacpp_alias: str = field(default_factory=lambda: os.getenv("LLAMACPP_ALIAS", ""))
+    llamacpp_host: str = field(default_factory=lambda: os.getenv("LLAMACPP_HOST", "127.0.0.1"))
+    llamacpp_port: int = field(default_factory=lambda: _int("LLAMACPP_PORT", 8081))
+    llamacpp_threads: int = field(default_factory=lambda: max(1, _int("LLAMACPP_THREADS", 8)))
+    llamacpp_batch_threads: int = field(
+        default_factory=lambda: max(1, _int("LLAMACPP_BATCH_THREADS", 8))
+    )
+    llamacpp_batch_size: int = field(
+        default_factory=lambda: max(1, _int("LLAMACPP_BATCH_SIZE", 512))
+    )
+    llamacpp_ubatch_size: int = field(
+        default_factory=lambda: max(1, _int("LLAMACPP_UBATCH_SIZE", 128))
+    )
+    llamacpp_parallel: int = field(default_factory=lambda: max(1, _int("LLAMACPP_PARALLEL", 1)))
+    llamacpp_flash_attention: bool = field(
+        default_factory=lambda: (
+            os.getenv("LLAMACPP_FLASH_ATTENTION", "false").strip().lower() in {"1", "true", "yes"}
+        )
+    )
+    llamacpp_embeddings: bool = field(
+        default_factory=lambda: (
+            os.getenv("LLAMACPP_EMBEDDINGS", "false").strip().lower() in {"1", "true", "yes"}
+        )
+    )
+    llamacpp_cache_prompt: bool = field(
+        default_factory=lambda: (
+            os.getenv("LLAMACPP_CACHE_PROMPT", "true").strip().lower() in {"1", "true", "yes"}
+        )
+    )
+    llamacpp_cache_ram_mib: int = field(
+        default_factory=lambda: max(0, _int("LLAMACPP_CACHE_RAM_MIB", 0))
+    )
+    llamacpp_cache_type_k: str = field(
+        default_factory=lambda: os.getenv("LLAMACPP_CACHE_TYPE_K", "")
+    )
+    llamacpp_cache_type_v: str = field(
+        default_factory=lambda: os.getenv("LLAMACPP_CACHE_TYPE_V", "")
+    )
+    llamacpp_log_file: str = field(
+        default_factory=lambda: os.getenv("LLAMACPP_LOG_FILE", "logs/llama-server.log")
+    )
+    llamacpp_log_max_mib: int = field(
+        default_factory=lambda: max(1, _int("LLAMACPP_LOG_MAX_MIB", 50))
+    )
+    llamacpp_restart_enabled: bool = field(
+        default_factory=lambda: (
+            os.getenv("LLAMACPP_RESTART_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
+        )
+    )
+    llamacpp_max_restarts: int = field(
+        default_factory=lambda: max(0, _int("LLAMACPP_MAX_RESTARTS", 5))
+    )
+    llamacpp_restart_delay_seconds: float = field(
+        default_factory=lambda: max(0.1, _float("LLAMACPP_RESTART_DELAY_SECONDS", 3.0))
+    )
+    llamacpp_startup_timeout_seconds: float = field(
+        default_factory=lambda: max(1.0, _float("LLAMACPP_STARTUP_TIMEOUT_SECONDS", 120.0))
+    )
     ollama_keep_alive: str = field(default_factory=lambda: os.getenv("OLLAMA_KEEP_ALIVE", "30m"))
     # Qwen3-family models think by default, which silently consumes the token
     # budget with reasoning. Default to explicit non-thinking unless a request
@@ -101,6 +203,7 @@ class Settings:
     max_context_length: int = field(
         default_factory=lambda: max(512, _int("MAX_CONTEXT_LENGTH", 8192))
     )
+    max_output_tokens: int = field(default_factory=lambda: max(1, _int("MAX_OUTPUT_TOKENS", 2048)))
     max_embedding_batch_size: int = field(
         default_factory=lambda: max(1, _int("MAX_EMBEDDING_BATCH_SIZE", 64))
     )
@@ -111,11 +214,36 @@ class Settings:
         return self.backend_http_timeout_seconds
 
     @property
+    def llamacpp_base_url(self) -> str:
+        if self.llamacpp_url:
+            return self.llamacpp_url
+        if self.llamacpp_managed:
+            return f"http://{self.llamacpp_host}:{self.llamacpp_port}"
+        return ""
+
+    @property
+    def llamacpp_model_map(self) -> dict[str, str]:
+        entries: dict[str, str] = {}
+        for item in self.llamacpp_model_map_raw.split(";"):
+            if "=" not in item:
+                continue
+            model_id, path = item.split("=", 1)
+            if model_id.strip() and path.strip():
+                entries[model_id.strip()] = path.strip()
+        return entries
+
+    @property
     def models(self) -> tuple[str, ...]:
-        return _csv("MODEL_REGISTRY", "qwen3:1.7b,qwen3:4b")
+        fallback = ",".join(self.llamacpp_model_map) or self.llamacpp_alias
+        if not fallback and self.llamacpp_model:
+            fallback = _model_id_from_path(self.llamacpp_model)
+        fallback = fallback or "qwen3:1.7b,qwen3:4b"
+        return _csv("MODEL_REGISTRY", fallback)
 
     @property
     def inference_models(self) -> tuple[str, ...]:
+        if (self.llamacpp_managed or self.llamacpp_url) and not self.llamacpp_embeddings:
+            return self.models
         return (*self.models, self.embedding_model)
 
     @property

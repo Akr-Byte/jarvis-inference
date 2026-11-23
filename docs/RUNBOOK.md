@@ -30,6 +30,25 @@ Restart the full stack when Ollama itself is unhealthy:
 docker compose restart ollama jarvis-inference
 ```
 
+## Native llama.cpp runtime
+
+The default Compose profile still uses Ollama. For native llama.cpp, follow the workstation
+profile in the README and set `LLAMACPP_MANAGED=true`. Check the managed child and probed options
+with authenticated requests:
+
+```bash
+curl -H "Authorization: Bearer $INFERENCE_API_KEY" http://127.0.0.1:8080/v1/runtime/status
+curl -H "Authorization: Bearer $INFERENCE_API_KEY" http://127.0.0.1:8080/v1/runtime/capabilities
+tail -n 100 logs/llama-server.log
+```
+
+`state=failed` includes the latest startup/recovery error. Check the GGUF path, model context
+metadata, estimated KV memory and available RAM before lowering headroom or raising the context.
+An unmanaged process occupying the configured port is never adopted or signaled; stop it through
+the supervisor that launched it or choose a free port. Model load/unload requests are rejected
+while the queue or active-request set is nonempty. External-server mode reports lifecycle controls
+as unsupported.
+
 ## Update
 
 ```bash
