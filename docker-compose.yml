@@ -9,18 +9,22 @@ services:
     stop_grace_period: 30s
     ports:
       - "8081:8080"
+    volumes:
+      - ./models:/models:ro
+    environment:
+      - LLAMA_MODEL_PATH=/models
+      - LLAMA_ALIAS=${LLAMACPP_ALIAS:-default-model}
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/health", "||", "exit 1"]
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:8080/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 10s
-    environment:
-      - LLAMA_MODEL_PATH=/models
-      - LLAMA_PORT=8080
+      start_period: 15s
 
   jarvis-inference:
-    image: jarvis-inference-jarvis-inference
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: jarvis-inference
     restart: unless-stopped
     init: true
@@ -48,19 +52,13 @@ services:
     environment:
       INFERENCE_BACKEND: llamacpp
       INFERENCE_HOST: 0.0.0.0
-      LLAMACPP_MANAGED: "true"
+      INFERENCE_PORT: "8080"
+      # llama-server runs as a separate container, so the gateway connects over HTTP
+      # instead of spawning its own managed llama-server process.
+      LLAMACPP_MANAGED: "false"
+      LLAMACPP_URL: http://llama-server:8080
       LLAMACPP_HOST: llama-server
       LLAMACPP_PORT: "8080"
-      INFERENCE_PORT: "8080"
-      # llama.cpp managed backend (set INFERENCE_BACKEND=llamacpp and provide
-      # the native binary + GGUF location, e.g. INFERENCE_BACKEND=llamacpp,
-      # LLAMACPP_SERVER=/usr/local/bin/llama-server, LLAMACPP_MODEL=/models/<model>.gguf,
-      # LLAMACPP_ALIAS=<alias>, MODEL_REGISTRY=<alias>, DEFAULT_MODEL=<alias>,
-      # MEMORY_BUDGET_GB=<n>, LLAMACPP_CACHE_TYPE_K=q8_0, LLAMACPP_CACHE_TYPE_V=q8_0,
-      # LLAMACPP_FLASH_ATTENTION=true). Mount the GGUF directory, for example:
-      #   volumes:
-      #     - ./models:/models:ro
-      # Ollama backend (default): model store lives in the `ollama` volume.
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=3)"]
       interval: 15s

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.0 - 2026-11-24
+
 ### Added
 
 - Optional native `llama-server` supervision with ownership/PID reporting, health gating, bounded
@@ -14,6 +16,12 @@
 - Qwen3-Next hybrid attention/recurrent memory estimation, component-level managed-runtime
   admission diagnostics, tokenizer-backed llama.cpp chat context checks, and startup/shutdown race
   protection for the owned process group.
+- Containerized `llama-server` image with the official llama.cpp release binary installed at build
+  time. No host binary or shared-library mounts are required; only `./models` is mounted read-only.
+- Deterministic GGUF selection with `LLAMA_MODEL`, model aliasing with `LLAMA_ALIAS`, and a startup
+  loop that waits for a mounted model instead of entering a restart loop.
+- Documented containerized model switching: restart `llama-server` to load a different GGUF; the
+  gateway refreshes the catalog automatically when the alias is unchanged.
 
 ### Changed
 
@@ -28,6 +36,13 @@
   above `LLAMACPP_PARALLEL`, unused llama.cpp slots, quantized KV caches without flash attention,
   non-loopback managed binds, and `LLAMACPP_JINJA=false`.
 - Empty numeric environment values now fall back to defaults instead of raising at import time.
+- The default Compose stack now runs llama.cpp as the primary engine in a dedicated container. The
+  gateway connects over `LLAMACPP_URL` and overrides managed mode to `false`; native managed mode
+  remains available for workstation deployments.
+- The gateway image installs its pinned Python dependencies and starts through `uvicorn`, so the
+  Compose build is self-contained.
+- The installer, environment example, README and runbook now describe the llama.cpp container
+  workflow, including how to change the mounted model.
 
 ### Performance
 
@@ -59,6 +74,9 @@
   new profile path is missing.
 - Gateway concurrency above `LLAMACPP_PARALLEL` is logged at startup; those requests previously
   queued inside `llama-server` and surfaced as gateway timeouts rather than a clear `429`.
+- `llama-server` healthchecks use `CMD-SHELL`, and the entrypoint passes an explicit `--port 8080`
+  and the configured model alias, so Compose dependency gating and gateway model discovery work
+  reliably.
 
 ## 0.5.1
 

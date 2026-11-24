@@ -29,5 +29,6 @@ def test_remote_gateway_configuration_is_documented() -> None:
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     assert "INFERENCE_BIND_ADDRESS=127.0.0.1" in env_example
     assert "INFERENCE_BIND_ADDRESS:-127.0.0.1" in compose
-    assert "OLLAMA_MAX_LOADED_MODELS: ${MAX_LOADED_MODELS:-1}" in compose
+    assert "./models:/models:ro" in compose
+    assert "LLAMACPP_URL: http://llama-server:8080" in compose
     assert "MAX_LOADED_MODELS=1" in env_example

@@ -6,13 +6,14 @@ INSTALL = ROOT / "scripts" / "install.sh"
 
 def test_install_script_removes_only_stale_application_containers() -> None:
     content = INSTALL.read_text(encoding="utf-8")
-    assert "for container in jarvis-inference jarvis-ollama; do" in content
+    assert "for container in jarvis-inference jarvis-llama-server; do" in content
     assert 'docker container inspect "$container"' in content
     assert 'docker rm -f "$container"' in content
     assert "docker compose down -v" not in content
 
 
-def test_install_script_pulls_all_configured_models() -> None:
+def test_install_script_requires_a_mounted_gguf_model() -> None:
     content = INSTALL.read_text(encoding="utf-8")
-    assert 'ollama pull "$model"' in content
-    assert 'ollama show "$model"' in content
+    assert 'gguf_models=("$ROOT"/models/*.gguf)' in content
+    assert "No GGUF model found in ./models" in content
+    assert "ollama pull" not in content

@@ -107,17 +107,20 @@ External llama-server and Ollama workflows remain supported through independent 
 Requirements: Docker Engine, Docker Compose v2 and `curl`.
 
 ```bash
-git clone https://github.com/abdullahalrifat/jarvis-inference.git
+git clone https://github.com/Akr-Byte/jarvis-inference.git
 cd jarvis-inference
 cp .env.example .env
 chmod 600 .env
+# llama-server mounts ./models read-only and uses the first *.gguf file found there.
+cp /path/to/model.gguf models/
 # Set INFERENCE_BIND_ADDRESS=0.0.0.0 and a long INFERENCE_API_KEY for remote access.
 bash scripts/install.sh
 ```
 
-The installer validates Docker/Compose, validates the Compose file, builds the gateway, starts
-Ollama, ensures configured models are present, waits for readiness, and runs authenticated smoke
-checks.
+The installer validates Docker/Compose, checks that a GGUF model is mounted, builds the bundled
+llama-server image and the gateway, starts both services, waits for readiness, and runs
+authenticated smoke checks. The llama-server binary is installed inside its image; no host binary
+is required. Ollama remains available through `docker-compose.ollama.yml`.
 
 Verify the deployment:
 
@@ -149,7 +152,10 @@ bash scripts/install.sh
 ## Configuration
 
 All runtime settings come from environment variables (see [`.env.example`](.env.example) for the full
-surface). Highlights:
+surface). The default `docker-compose.yml` runs llama-server in its own container and sets
+`LLAMACPP_MANAGED=false` plus `LLAMACPP_URL=http://llama-server:8080` for the gateway, regardless of
+the values in `.env`. Place a GGUF in `./models`; the container selects the first one and exposes it
+under `LLAMACPP_ALIAS` (default `default-model`). Highlights:
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -486,10 +492,10 @@ View gateway logs:
 docker compose logs --tail=200 jarvis-inference
 ```
 
-View Ollama logs:
+View llama-server logs:
 
 ```bash
-docker compose logs --tail=200 ollama
+docker compose logs --tail=200 llama-server
 ```
 
 Follow logs:
@@ -504,10 +510,74 @@ Restart only the gateway:
 docker compose restart jarvis-inference
 ```
 
+Restart the engine:
+
+```bash
+docker compose restart llama-server
+```
+
 Restart both services:
 
 ```bash
-docker compose restart ollama jarvis-inference
+docker compose restart llama-server jarvis-inference
+```
+
+#### Changing the mounted model while the stack is running
+
+`llama-server` loads exactly one GGUF when its process starts. The gateway's
+`/v1/models/{id}/load` and `/unload` endpoints require native managed mode
+(`LLAMACPP_MANAGED=true` inside the gateway), which the default Compose stack does not use because
+the engine runs in its own container. Therefore there is **no hot swap**: restart the engine
+container after changing the model. The gateway itself normally does not need a restart.
+
+1. Put the new GGUF in `./models/`:
+
+   ```bash
+   cp /path/to/new-model.gguf ./models/
+   ```
+
+2. Make model selection deterministic. By default the entrypoint picks the first `*.gguf` it finds,
+   which is not stable if several models are mounted. Set an explicit file in the `llama-server`
+   environment in `docker-compose.yml`:
+
+   ```yaml
+   environment:
+     - LLAMA_MODEL_PATH=/models
+     - LLAMA_MODEL=/models/new-model.gguf
+     - LLAMA_ALIAS=${LLAMACPP_ALIAS:-default-model}
+   ```
+
+3. Recreate the engine container:
+
+   ```bash
+   docker compose up -d --force-recreate llama-server
+   ```
+
+   If the environment and mounted files did not change, a plain restart is enough:
+
+   ```bash
+   docker compose restart llama-server
+   ```
+
+4. Verify:
+
+   ```bash
+   curl -s http://127.0.0.1:8081/health
+   curl -s http://127.0.0.1:8080/ready
+   ```
+
+The gateway refreshes its catalog every `MODEL_REFRESH_SECONDS` (15s), so the same alias recovers
+automatically. If you also change the public model identity, update these together in `.env` and
+recreate both services:
+
+```env
+LLAMACPP_ALIAS=new-model
+MODEL_REGISTRY=new-model
+DEFAULT_MODEL=new-model
+```
+
+```bash
+docker compose up -d --force-recreate llama-server jarvis-inference
 ```
 
 ### 5. Shut down the inference stack
