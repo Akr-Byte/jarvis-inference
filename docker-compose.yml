@@ -12,7 +12,8 @@ services:
       # authenticated gateway on 8080.
       - "${LLAMACPP_BIND_ADDRESS:-127.0.0.1}:8081:8080"
     volumes:
-      - ./models:/models:ro
+      # MODEL_DIRECTORY may be an absolute path or ~/...; Compose expands ~ to the host home.
+      - ${MODEL_DIRECTORY:-./models}:/models:ro
     cpus: ${LLAMACPP_THREADS:-8}
     mem_limit: ${MEMORY_BUDGET_GB:-10}g
     pids_limit: 256

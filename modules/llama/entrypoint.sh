@@ -21,7 +21,7 @@ while true; do
         fi
         if [ "$notified" -eq 0 ]; then
             echo "No GGUF model found in $MODEL_PATH"
-            echo "Mount a model at ./models:/models:ro, for example: cp /path/to/model.gguf ./models/"
+            echo "Mount a GGUF at /models (set MODEL_DIRECTORY on the host) or set LLAMA_MODEL."
             echo "Waiting for a model to appear..."
             notified=1
         fi
@@ -29,7 +29,7 @@ while true; do
         break
     elif [ "$notified" -eq 0 ]; then
         echo "GGUF model path does not exist: $MODEL_PATH"
-        echo "Mount a model at ./models:/models:ro or set LLAMA_MODEL to a valid file."
+        echo "Mount a GGUF at /models (set MODEL_DIRECTORY on the host) or set LLAMA_MODEL."
         echo "Waiting for a model to appear..."
         notified=1
     fi

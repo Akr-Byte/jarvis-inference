@@ -48,13 +48,17 @@ if [[ "$bind_address" != "127.0.0.1" && "$bind_address" != "::1" && -z "$api_key
   fail "INFERENCE_API_KEY is required when the gateway is remotely reachable."
 fi
 
+model_dir="${MODEL_DIRECTORY:-$ROOT/models}"
+model_dir="${model_dir/#\~/$HOME}"
+[[ "$model_dir" == /* ]] || model_dir="$ROOT/$model_dir"
+
 shopt -s nullglob
-gguf_models=("$ROOT"/models/*.gguf)
+gguf_models=("$model_dir"/*.gguf)
 shopt -u nullglob
 (( ${#gguf_models[@]} > 0 )) || {
-  fail "No GGUF model found in ./models. Copy at least one .gguf file there before install."
+  fail "No GGUF model found in $model_dir. Copy a .gguf there or set MODEL_DIRECTORY in .env."
 }
-echo "==> Found ${#gguf_models[@]} GGUF model(s) in ./models"
+echo "==> Found ${#gguf_models[@]} GGUF model(s) in $model_dir"
 
 echo "==> Cleaning stale inference containers"
 # Compose uses stable container names. Remove only this application containers;

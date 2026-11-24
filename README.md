@@ -110,8 +110,10 @@ git clone https://github.com/Akr-Byte/jarvis-inference.git
 cd jarvis-inference
 cp .env.example .env
 chmod 600 .env
-# llama-server mounts ./models read-only and uses the first *.gguf file found there.
-cp /path/to/model.gguf models/
+# llama-server mounts MODEL_DIRECTORY read-only at /models (default ./models, or ~/models
+# in the shipped .env) and uses the first *.gguf file found there.
+mkdir -p ~/models
+cp /path/to/model.gguf ~/models/
 # Set INFERENCE_BIND_ADDRESS=0.0.0.0 and a long INFERENCE_API_KEY for remote access.
 bash scripts/install.sh
 ```
@@ -153,8 +155,10 @@ bash scripts/install.sh
 All runtime settings come from environment variables (see [`.env.example`](.env.example) for the full
 surface). The default `docker-compose.yml` runs llama-server in its own container and sets
 `LLAMACPP_MANAGED=false` plus `LLAMACPP_URL=http://llama-server:8080` for the gateway, regardless of
-the values in `.env`. Place a GGUF in `./models`; the container selects the first one and exposes it
-under `LLAMACPP_ALIAS` (default `default-model`). Highlights:
+the values in `.env`. Place a GGUF in `MODEL_DIRECTORY` on the host (default `./models`; set it to
+`~/models` or an absolute path to use a directory outside the checkout). Compose bind-mounts that
+directory read-only at `/models`; the container selects the first GGUF and exposes it under
+`LLAMACPP_ALIAS` (default `default-model`). Highlights:
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -181,7 +185,7 @@ under `LLAMACPP_ALIAS` (default `default-model`). Highlights:
 | `LLAMACPP_MANAGED` | `false` | Launch and supervise a local llama-server child. |
 | `LLAMACPP_MODEL` / `LLAMACPP_ALIAS` | *(empty)* | GGUF file or first split shard, and public model ID. |
 | `LLAMACPP_MODEL_MAP` | *(empty)* | Optional `id=/path/model.gguf;id2=/path/other.gguf` profiles for managed model switching. |
-| `MODEL_DIRECTORY` | `~/models` | Root recursively scanned for GGUFs and complete split sets. |
+| `MODEL_DIRECTORY` | `~/models` | Host directory mounted at `/models` in the engine container; also the recursive scan root for native managed mode. `~` is expanded to the OS home. |
 | `LLAMACPP_THREADS` / `LLAMACPP_BATCH_THREADS` | physical cores | Generation and prompt-processing CPU threads; defaults avoid SMT oversubscription. |
 | `LLAMACPP_BATCH_SIZE` / `LLAMACPP_UBATCH_SIZE` | `512` / `128` | llama.cpp logical batch and micro-batch; larger values trade memory for prefill throughput. |
 | `LLAMACPP_PARALLEL` | `1` | llama-server slots; keep `MAX_CONCURRENT_REQUESTS <= LLAMACPP_PARALLEL`. |
@@ -542,10 +546,11 @@ docker compose restart llama-server jarvis-inference
 the engine runs in its own container. Therefore there is **no hot swap**: restart the engine
 container after changing the model. The gateway itself normally does not need a restart.
 
-1. Put the new GGUF in `./models/`:
+1. Put the new GGUF in the host `MODEL_DIRECTORY` (`./models` by default, `~/models` in the shipped
+   `.env`):
 
    ```bash
-   cp /path/to/new-model.gguf ./models/
+   cp /path/to/new-model.gguf ~/models/
    ```
 
 2. Pin the file when more than one GGUF is mounted. `docker-compose.yml` forwards `LLAMA_MODEL`, and

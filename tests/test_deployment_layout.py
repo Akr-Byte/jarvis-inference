@@ -56,12 +56,20 @@ def test_gateway_image_has_no_pip_or_known_vulnerable_zlib() -> None:
     assert "ensurepip" in dockerfile, "bundled pip wheel must not remain in the image"
 
 
+def test_model_directory_can_point_at_host_home() -> None:
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert "MODEL_DIRECTORY=~/models" in env_example
+    installer = (ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+    assert "MODEL_DIRECTORY" in installer
+    assert "$HOME" in installer, "installer must expand ~ to the host home directory"
+
+
 def test_remote_gateway_configuration_is_documented() -> None:
     env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     assert "INFERENCE_BIND_ADDRESS=127.0.0.1" in env_example
     assert "INFERENCE_BIND_ADDRESS:-127.0.0.1" in compose
-    assert "./models:/models:ro" in compose
+    assert "${MODEL_DIRECTORY:-./models}:/models:ro" in compose
     assert "LLAMACPP_URL: http://llama-server:8080" in compose
     assert "LLAMACPP_BIND_ADDRESS:-127.0.0.1" in compose
     assert "LLAMACPP_THREADS=${LLAMACPP_THREADS:-8}" in compose

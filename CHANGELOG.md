@@ -57,6 +57,9 @@
   at runtime), without suppressing any advisory.
 - The release workflow refuses to publish a tag whose commit is not an ancestor of `origin/main`,
   so a tag pushed from an unmerged feature branch can no longer produce a release.
+- The `llama-server` bind mount now follows `MODEL_DIRECTORY`, so GGUF files can live in the OS home
+  directory (`~/models`) or any absolute host path instead of the repository checkout. The installer
+  expands `~` the same way and all model-switching docs use the configured host directory.
 
 ### Performance
 

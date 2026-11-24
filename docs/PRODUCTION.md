@@ -8,7 +8,7 @@ Recommended CPU-only profile:
 - 10-12 GiB RAM
 - llama-server: `LLAMACPP_THREADS` CPU / `MEMORY_BUDGET_GB` RAM
 - Gateway: `INFERENCE_CPUS` CPU / `INFERENCE_MEMORY_LIMIT` RAM
-- SSD-backed `./models` mount containing the production GGUF
+- SSD-backed `MODEL_DIRECTORY` mount containing the production GGUF
 - One active generation and one loaded model
 
 ## Install

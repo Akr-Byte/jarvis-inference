@@ -39,7 +39,8 @@ docker compose restart llama-server jarvis-inference
 ## llama.cpp engine and model switching
 
 The default Compose profile runs llama-server in its own container. The binary is installed in the
-image; only `./models` is mounted into the container as `/models:ro`. Check the engine and gateway:
+image; only the host `MODEL_DIRECTORY` (default `./models`, `~/models` in the shipped `.env`) is
+mounted into the container as `/models:ro`. Check the engine and gateway:
 
 ```bash
 docker compose ps
@@ -53,10 +54,10 @@ docker compose logs --tail=100 llama-server
 is set for the gateway, so **changing models requires restarting the engine container**. The
 gateway normally does not need a restart as long as the public alias stays the same.
 
-1. Put the new GGUF in `./models/`:
+1. Put the new GGUF in the host `MODEL_DIRECTORY`:
 
    ```bash
-   cp /path/to/new-model.gguf ./models/
+   cp /path/to/new-model.gguf ~/models/
    ```
 
 2. Pin the file when several GGUFs are mounted. Compose forwards `LLAMA_MODEL`; otherwise the
@@ -117,7 +118,8 @@ git pull --ff-only
 bash scripts/install.sh
 ```
 
-The installer rebuilds the gateway and llama-server image. GGUF files in `./models` are preserved.
+The installer rebuilds the gateway and llama-server image. GGUF files in the host `MODEL_DIRECTORY`
+are preserved.
 
 ## Networking
 
@@ -156,7 +158,8 @@ git pull --ff-only
 bash scripts/install.sh
 ```
 
-The installer is the canonical redeployment path. It preserves GGUF files in `./models`.
+The installer is the canonical redeployment path. It preserves GGUF files in the host
+`MODEL_DIRECTORY`.
 
 ### Stop / start
 
@@ -179,7 +182,8 @@ This removes containers and the Compose network but keeps model data.
 docker compose down -v
 ```
 
-This removes named volumes. Mounted GGUF files under `./models` are host files and are not removed; Ollama model volumes, if used separately, would be removed.
+This removes named volumes. Mounted GGUF files under the host `MODEL_DIRECTORY` are host files and
+are not removed; Ollama model volumes, if used separately, would be removed.
 
 ### Complete application removal
 
