@@ -51,6 +51,10 @@
   including `latest`, and scan the image at `HIGH,CRITICAL` to match the security workflow.
 - `docs/releasing.md` documents the version policy, pre-release checklist, local CI-equivalent gate,
   publication steps and post-release verification.
+- The gateway image installs the patched `zlib1g` build and drops pip/ensurepip after dependency
+  installation. This clears the `HIGH` Trivy findings from the pinned base's stale `zlib1g` and
+  from pip's vendored SBOM (stale `msgpack`, `setuptools` and `urllib3` copies that are never used
+  at runtime), without suppressing any advisory.
 
 ### Performance
 

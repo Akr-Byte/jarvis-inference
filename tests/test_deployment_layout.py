@@ -49,6 +49,13 @@ def test_dockerfiles_run_as_non_root() -> None:
         assert all("root" not in d.lower() for d in directives), directives
 
 
+def test_gateway_image_has_no_pip_or_known_vulnerable_zlib() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "zlib1g" in dockerfile, "patched zlib1g must be installed at build time"
+    assert "site-packages/pip" in dockerfile, "pip must be removed from the runtime image"
+    assert "ensurepip" in dockerfile, "bundled pip wheel must not remain in the image"
+
+
 def test_remote_gateway_configuration_is_documented() -> None:
     env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
