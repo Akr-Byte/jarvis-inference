@@ -1,4 +1,26 @@
 services:
+  llama-server:
+    build:
+      context: ./modules/llama
+      dockerfile: Dockerfile
+    container_name: jarvis-llama-server
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    volumes:
+      - ./models:/models:ro
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/health", "||", "exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    environment:
+      - LLAMA_MODEL_PATH=/models
+      - LLAMA_PORT=8080
+
   jarvis-inference:
     build:
       context: .
@@ -9,6 +31,9 @@ services:
     stop_grace_period: 30s
     env_file:
       - .env
+    depends_on:
+      llama-server:
+        condition: service_healthy
     ports:
       - "${INFERENCE_BIND_ADDRESS:-127.0.0.1}:${INFERENCE_PORT:-8080}:8080"
     cpus: ${INFERENCE_CPUS:-0.4}
@@ -27,6 +52,9 @@ services:
     environment:
       INFERENCE_BACKEND: llamacpp
       INFERENCE_HOST: 0.0.0.0
+      LLAMACPP_MANAGED: "true"
+      LLAMACPP_HOST: llama-server
+      LLAMACPP_PORT: "8080"
       INFERENCE_PORT: "8080"
       # llama.cpp managed backend (set INFERENCE_BACKEND=llamacpp and provide
       # the native binary + GGUF location, e.g. INFERENCE_BACKEND=llamacpp,
@@ -43,5 +71,3 @@ services:
       timeout: 5s
       retries: 10
       start_period: 25s
-
-volumes:
