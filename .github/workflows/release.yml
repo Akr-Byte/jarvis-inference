@@ -66,6 +66,18 @@ jobs:
           print(f"validated release {tag} at version {version}")
           PY
 
+      - name: Require tag commit to be on main
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+            echo "error: $RELEASE_TAG points at $(git rev-parse --short HEAD), which is not on main." >&2
+            echo "Merge the release commit into main before publishing." >&2
+            exit 1
+          fi
+
       - name: Check whether release is new
         id: release
         env:

@@ -55,6 +55,8 @@
   installation. This clears the `HIGH` Trivy findings from the pinned base's stale `zlib1g` and
   from pip's vendored SBOM (stale `msgpack`, `setuptools` and `urllib3` copies that are never used
   at runtime), without suppressing any advisory.
+- The release workflow refuses to publish a tag whose commit is not an ancestor of `origin/main`,
+  so a tag pushed from an unmerged feature branch can no longer produce a release.
 
 ### Performance
 

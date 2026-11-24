@@ -12,6 +12,12 @@ def test_release_metadata_is_consistent() -> None:
     assert check(ROOT) == []
 
 
+def test_release_workflow_requires_tag_to_be_on_main() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    assert "merge-base --is-ancestor HEAD" in workflow
+    assert "refs/remotes/origin/main" in workflow
+
+
 def test_consistency_check_detects_readme_drift(tmp_path: Path) -> None:
     for name in ("pyproject.toml", "README.md", "CHANGELOG.md"):
         shutil.copy2(ROOT / name, tmp_path / name)
