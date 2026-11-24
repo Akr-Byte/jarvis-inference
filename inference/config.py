@@ -7,15 +7,27 @@ from pathlib import Path
 
 
 def _int(name: str, default: int) -> int:
-    return int(os.getenv(name, str(default)))
+    value = os.getenv(name, "").strip()
+    return int(value) if value else default
 
 
 def _float(name: str, default: float) -> float:
-    return float(os.getenv(name, str(default)))
+    value = os.getenv(name, "").strip()
+    return float(value) if value else default
 
 
 def _csv(name: str, default: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in os.getenv(name, default).split(",") if item.strip())
+
+
+def _physical_cores() -> int:
+    """Best-effort physical core count; CPU-heavy defaults should not use SMT siblings."""
+    try:
+        import psutil
+
+        return max(1, psutil.cpu_count(logical=False) or 8)
+    except Exception:  # pragma: no cover - psutil is a hard dependency
+        return 8
 
 
 def _model_id_from_path(value: str) -> str:
@@ -136,9 +148,11 @@ class Settings:
     llamacpp_alias: str = field(default_factory=lambda: os.getenv("LLAMACPP_ALIAS", ""))
     llamacpp_host: str = field(default_factory=lambda: os.getenv("LLAMACPP_HOST", "127.0.0.1"))
     llamacpp_port: int = field(default_factory=lambda: _int("LLAMACPP_PORT", 8081))
-    llamacpp_threads: int = field(default_factory=lambda: max(1, _int("LLAMACPP_THREADS", 8)))
+    llamacpp_threads: int = field(
+        default_factory=lambda: max(1, _int("LLAMACPP_THREADS", _physical_cores()))
+    )
     llamacpp_batch_threads: int = field(
-        default_factory=lambda: max(1, _int("LLAMACPP_BATCH_THREADS", 8))
+        default_factory=lambda: max(1, _int("LLAMACPP_BATCH_THREADS", _physical_cores()))
     )
     llamacpp_batch_size: int = field(
         default_factory=lambda: max(1, _int("LLAMACPP_BATCH_SIZE", 512))
@@ -147,10 +161,42 @@ class Settings:
         default_factory=lambda: max(1, _int("LLAMACPP_UBATCH_SIZE", 128))
     )
     llamacpp_parallel: int = field(default_factory=lambda: max(1, _int("LLAMACPP_PARALLEL", 1)))
+    llamacpp_gpu_layers: int = field(default_factory=lambda: max(0, _int("LLAMACPP_GPU_LAYERS", 0)))
     llamacpp_flash_attention: bool = field(
         default_factory=lambda: (
             os.getenv("LLAMACPP_FLASH_ATTENTION", "false").strip().lower() in {"1", "true", "yes"}
         )
+    )
+    # --jinja enables the model's own chat template (tool calling, correct
+    # system/assistant roles, reasoning blocks). Without it llama-server uses
+    # a generic template that silently degrades agent prompts.
+    llamacpp_jinja: bool = field(
+        default_factory=lambda: (
+            os.getenv("LLAMACPP_JINJA", "true").strip().lower() in {"1", "true", "yes"}
+        )
+    )
+    # --metrics exposes llama-server's own Prometheus endpoint so operators can
+    # inspect prompt-cache hits, slot utilisation and tokens/s independently.
+    llamacpp_metrics: bool = field(
+        default_factory=lambda: (
+            os.getenv("LLAMACPP_METRICS", "true").strip().lower() in {"1", "true", "yes"}
+        )
+    )
+    # --mlock keeps model weights resident on CPU workstations; it is opt-in
+    # because constrained hosts can be pushed into OOM by locked pages.
+    llamacpp_mlock: bool = field(
+        default_factory=lambda: (
+            os.getenv("LLAMACPP_MLOCK", "false").strip().lower() in {"1", "true", "yes"}
+        )
+    )
+    # "auto" lets recent builds lift reasoning_content out of the message body.
+    llamacpp_reasoning_format: str = field(
+        default_factory=lambda: os.getenv("LLAMACPP_REASONING_FORMAT", "").strip().lower()
+    )
+    # Minimum chunk size (tokens) for prefix reuse between related prompts;
+    # 0 disables the extra reuse pass.
+    llamacpp_cache_reuse: int = field(
+        default_factory=lambda: max(0, _int("LLAMACPP_CACHE_REUSE", 0))
     )
     llamacpp_embeddings: bool = field(
         default_factory=lambda: (
@@ -189,7 +235,7 @@ class Settings:
         default_factory=lambda: max(0.1, _float("LLAMACPP_RESTART_DELAY_SECONDS", 3.0))
     )
     llamacpp_startup_timeout_seconds: float = field(
-        default_factory=lambda: max(1.0, _float("LLAMACPP_STARTUP_TIMEOUT_SECONDS", 120.0))
+        default_factory=lambda: max(1.0, _float("LLAMACPP_STARTUP_TIMEOUT_SECONDS", 300.0))
     )
     ollama_keep_alive: str = field(default_factory=lambda: os.getenv("OLLAMA_KEEP_ALIVE", "30m"))
     # Qwen3-family models think by default, which silently consumes the token

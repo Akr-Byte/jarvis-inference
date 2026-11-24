@@ -19,8 +19,11 @@ class LlamaCppBackend:
             connect=min(10.0, settings.backend_http_timeout_seconds),
         )
         limits = httpx.Limits(
-            max_connections=2,
-            max_keepalive_connections=1,
+            # Permit one connection per llama.cpp slot plus a short-headroom
+            # spare, so gateway-level concurrency is never serialized inside
+            # the HTTP pool.
+            max_connections=max(4, settings.max_concurrent_requests + 2),
+            max_keepalive_connections=max(2, settings.max_concurrent_requests),
             keepalive_expiry=30.0,
         )
         self._client = httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=False)
@@ -148,6 +151,12 @@ class LlamaCppBackend:
         body.pop("num_ctx", None)
         body["model"] = model
         body["stream"] = True
+        stream_options = dict(body.get("stream_options") or {})
+        # Request a terminal usage chunk unconditionally: the gateway needs
+        # token accounting even when the client did not ask for usage. The API
+        # layer suppresses the usage-only chunk for clients that did not opt in.
+        stream_options["include_usage"] = True
+        body["stream_options"] = stream_options
         try:
             async with self._client.stream(
                 "POST", f"{settings.llamacpp_base_url}/v1/chat/completions", json=body

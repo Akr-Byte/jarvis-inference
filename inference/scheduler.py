@@ -46,13 +46,31 @@ class StreamLease:
     released: bool = False
 
 
-def _check_context_window(payload: dict[str, Any], actual_prompt_tokens: int | None = None) -> None:
-    """Reject requests that cannot fit the effective context window (GW-6).
+# Keys that do not belong to the rendered prompt. Kept in one place so the
+# heuristic estimate and the exact tokenizer count agree on the payload.
+_NON_PROMPT_KEYS = frozenset(
+    {
+        "max_tokens",
+        "max_completion_tokens",
+        "num_ctx",
+        "stream",
+        "stream_options",
+        "temperature",
+        "top_p",
+        "top_k",
+        "seed",
+        "stop",
+        "presence_penalty",
+        "frequency_penalty",
+    }
+)
+# Below this fraction of the context window an exact tokenizer count cannot
+# change admission, so the extra engine round-trip is skipped.
+TOKENIZER_ADMISSION_RATIO = 0.8
 
-    llama.cpp's tokenizer route counts the rendered chat prompt when present.
-    Otherwise this uses a UTF-8 JSON byte-length heuristic, which is explicitly
-    an estimate and may differ from the backend tokenizer.
-    """
+
+def _context_limits(payload: dict[str, Any]) -> tuple[int, int]:
+    """Return the effective context window and the reserved output budget."""
     requested_context = payload.get("num_ctx")
     if requested_context is not None and int(requested_context) > settings.max_context_length:
         raise InferenceError(
@@ -65,6 +83,8 @@ def _check_context_window(payload: dict[str, Any], actual_prompt_tokens: int | N
         int(requested_context) if requested_context is not None else settings.max_context_length
     )
     requested_output = payload.get("max_tokens")
+    if requested_output is None:
+        requested_output = payload.get("max_completion_tokens")
     output_budget = (
         int(requested_output) if requested_output is not None else settings.max_output_tokens
     )
@@ -75,27 +95,31 @@ def _check_context_window(payload: dict[str, Any], actual_prompt_tokens: int | N
             False,
             400,
         )
-    messages = payload.get("messages", [])
-    prompt_payload = {
-        key: value
-        for key, value in payload.items()
-        if key
-        not in {
-            "max_tokens",
-            "max_completion_tokens",
-            "num_ctx",
-            "stream",
-            "stream_options",
-            "temperature",
-            "top_p",
-            "top_k",
-            "seed",
-            "stop",
-            "presence_penalty",
-            "frequency_penalty",
-        }
-    }
-    estimated = estimate_prompt_tokens(prompt_payload or messages)
+    return effective, output_budget
+
+
+def _prompt_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in payload.items() if key not in _NON_PROMPT_KEYS}
+
+
+def _check_context_window(
+    payload: dict[str, Any],
+    actual_prompt_tokens: int | None = None,
+    *,
+    estimated_prompt_tokens: int | None = None,
+) -> None:
+    """Reject requests that cannot fit the effective context window (GW-6).
+
+    llama.cpp's tokenizer route counts the rendered chat prompt when present.
+    Otherwise this uses a UTF-8 JSON byte-length heuristic, which is explicitly
+    an estimate and may differ from the backend tokenizer.
+    """
+    effective, output_budget = _context_limits(payload)
+    estimated = (
+        estimated_prompt_tokens
+        if estimated_prompt_tokens is not None
+        else estimate_prompt_tokens(_prompt_payload(payload) or payload.get("messages", []))
+    )
     prompt_tokens = actual_prompt_tokens if actual_prompt_tokens is not None else estimated
     CONTEXT_USAGE.labels(model=str(payload.get("model") or settings.default_model)).observe(
         (prompt_tokens + output_budget) / effective
@@ -136,11 +160,20 @@ def estimate_prompt_tokens(messages: Any) -> int:
     return max(byte_estimate, groups)
 
 
-async def _admit_context_window(payload: dict[str, Any], backend: LlamaCppBackend) -> None:
+async def _admit_context_window(payload: dict[str, Any], backend: Any) -> None:
     model = str(payload.get("model") or settings.default_model)
+    effective, output_budget = _context_limits(payload)
+    estimated = estimate_prompt_tokens(_prompt_payload(payload) or payload.get("messages", []))
+    if estimated + output_budget <= effective * TOKENIZER_ADMISSION_RATIO:
+        # Comfortably inside the window: an exact count cannot change the
+        # verdict, and the extra request would serialize on the engine's
+        # tokenizer before every generation (a measurable TTFT cost for long
+        # prompts). Keep the cheap heuristic for admission and metrics.
+        _check_context_window(payload, estimated_prompt_tokens=estimated)
+        return
     tokenizer = getattr(backend, "count_chat_tokens", None)
     actual = await tokenizer(model, payload) if tokenizer else None
-    _check_context_window(payload, actual_prompt_tokens=actual)
+    _check_context_window(payload, actual_prompt_tokens=actual, estimated_prompt_tokens=estimated)
 
 
 class Scheduler:
@@ -150,6 +183,7 @@ class Scheduler:
         self._ollama = OllamaBackend()
         self._llama = LlamaCppBackend()
         self._active: dict[str, dict[str, Any]] = {}
+        self._model_active: dict[str, int] = {}
         self._request_counter = 0
         self._sweeper_task: asyncio.Task[None] | None = None
         self._runtime_maintenance = False
@@ -255,6 +289,20 @@ class Scheduler:
         else:
             ACTIVE_REQUEST_AGE.set(0)
 
+    def _activate_model(self, model: str) -> None:
+        """Count active requests per model so concurrency>1 stays accurate."""
+        count = self._model_active.get(model, 0) + 1
+        self._model_active[model] = count
+        ACTIVE_MODEL.labels(model=model).set(count)
+
+    def _deactivate_model(self, model: str) -> None:
+        count = max(0, self._model_active.get(model, 0) - 1)
+        if count:
+            self._model_active[model] = count
+        else:
+            self._model_active.pop(model, None)
+        ACTIVE_MODEL.labels(model=model).set(count)
+
     @property
     def stale_request_seconds(self) -> float:
         """Age after which an active slot must belong to an abandoned request.
@@ -287,6 +335,7 @@ class Scheduler:
             STALE_REQUESTS.inc()
             swept.append(request_id)
             if not any(other["model"] == model for other in self._active.values()):
+                self._model_active.pop(model, None)
                 ACTIVE_MODEL.labels(model=model).set(0)
         if self._active:
             oldest = min(item["started_monotonic"] for item in self._active.values())
@@ -406,7 +455,7 @@ class Scheduler:
                     RESOURCE_REJECTIONS.inc()
                     raise
                 model_manager.activate(model, warm)
-                ACTIVE_MODEL.labels(model=model).set(1)
+                self._activate_model(model)
                 try:
                     vectors = await asyncio.wait_for(
                         self.backend.embeddings(model, inputs),
@@ -441,7 +490,7 @@ class Scheduler:
                     REQUESTS.labels(model=model, status="error").inc()
                     raise error from exc
                 finally:
-                    ACTIVE_MODEL.labels(model=model).set(0)
+                    self._deactivate_model(model)
             except asyncio.CancelledError:
                 if not acquired:
                     CANCELLED_REQUESTS.labels(kind="queued").inc()
@@ -456,7 +505,7 @@ class Scheduler:
     async def chat(self, payload: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
         model = str(payload.get("model") or settings.default_model)
         model_manager.validate_chat(model)
-        await _admit_context_window(payload, self._llama)
+        await _admit_context_window(payload, self.backend)
         payload = dict(payload)
         payload.setdefault("max_tokens", settings.max_output_tokens)
         request_id = request_id or self._new_request_id()
@@ -484,7 +533,7 @@ class Scheduler:
                     RESOURCE_REJECTIONS.inc()
                     raise
                 model_manager.activate(model, warm)
-                ACTIVE_MODEL.labels(model=model).set(1)
+                self._activate_model(model)
                 try:
                     result = await asyncio.wait_for(
                         self.backend.chat(model, payload),
@@ -525,7 +574,7 @@ class Scheduler:
                     REQUESTS.labels(model=model, status="error").inc()
                     raise error from exc
                 finally:
-                    ACTIVE_MODEL.labels(model=model).set(0)
+                    self._deactivate_model(model)
             except asyncio.CancelledError:
                 if not acquired:
                     CANCELLED_REQUESTS.labels(kind="queued").inc()
@@ -543,7 +592,7 @@ class Scheduler:
         """Admit a stream before HTTP headers are committed by StreamingResponse."""
         model = str(payload.get("model") or settings.default_model)
         model_manager.validate_chat(model)
-        await _admit_context_window(payload, self._llama)
+        await _admit_context_window(payload, self.backend)
         payload = dict(payload)
         payload.setdefault("max_tokens", settings.max_output_tokens)
         request_id = request_id or self._new_request_id()
@@ -570,7 +619,7 @@ class Scheduler:
                 RESOURCE_REJECTIONS.inc()
                 raise
             model_manager.activate(model, warm)
-            ACTIVE_MODEL.labels(model=model).set(1)
+            self._activate_model(model)
             lease = StreamLease(model=model, request_id=request_id)
             lease_created = True
             return lease
@@ -591,7 +640,7 @@ class Scheduler:
         if lease.released:
             return
         lease.released = True
-        ACTIVE_MODEL.labels(model=lease.model).set(0)
+        self._deactivate_model(lease.model)
         self._release_slot(lease.request_id, lease.model)
 
     async def stream(

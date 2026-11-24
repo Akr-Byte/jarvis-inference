@@ -15,6 +15,43 @@
   admission diagnostics, tokenizer-backed llama.cpp chat context checks, and startup/shutdown race
   protection for the owned process group.
 
+### Changed
+
+- Managed llama.cpp now passes the engine-parity flags that other OpenAI-compatible servers rely
+  on: `--jinja` for the model chat template (tool calls, roles, reasoning extraction), `--metrics`
+  for engine-level telemetry, plus opt-in `--mlock`, `--n-gpu-layers`, `--cache-reuse` and
+  `--reasoning-format`. Every flag is still gated on the `--help` capability probe.
+- CPU thread defaults follow the physical core count instead of a fixed `8`, avoiding SMT
+  oversubscription on small hosts.
+- `LLAMACPP_STARTUP_TIMEOUT_SECONDS` defaults to `300` so large GGUFs can finish loading.
+- Startup logs warn about configurations that degrade throughput or safety: gateway concurrency
+  above `LLAMACPP_PARALLEL`, unused llama.cpp slots, quantized KV caches without flash attention,
+  non-loopback managed binds, and `LLAMACPP_JINJA=false`.
+- Empty numeric environment values now fall back to defaults instead of raising at import time.
+
+### Performance
+
+- Exact tokenizer-based context admission only runs near the context limit (>= 80% of prompt plus
+  output budget); shorter prompts skip the extra engine round-trip before generation.
+- Streaming requests always ask llama.cpp for a terminal usage chunk so completion tokens are
+  metered, and the usage-only chunk is filtered out for clients that did not request it.
+- GGUF discovery caches parsed headers by path, size and mtime and skips materialising tokenizer
+  vocabulary arrays, so `/v1/model-registry`, `/v1/models/{id}` and status endpoints no longer
+  re-parse every model on each call (a 150k-token vocabulary costs ~20 ms per scan).
+- `inference_active_model` is counted per model, so it stays correct when
+  `MAX_CONCURRENT_REQUESTS > 1`.
+- The body-limit middleware is pure ASGI: no per-request wrapper task, and streaming responses
+  keep their disconnect semantics.
+- llama.cpp HTTP connection limits scale with gateway concurrency instead of a fixed pool of two.
+
+### Fixed
+
+- Managed model load pre-flights the target GGUF and returns `409 MODEL_FILE_MISSING` without
+  unloading the running model, instead of stopping the working model before discovering that the
+  new profile path is missing.
+- Gateway concurrency above `LLAMACPP_PARALLEL` is logged at startup; those requests previously
+  queued inside `llama-server` and surfaced as gateway timeouts rather than a clear `429`.
+
 ## 0.5.1
 
 ### Fixed

@@ -323,6 +323,27 @@ async def _model_lifecycle(model_id: str, load: bool) -> object:
                 }
             },
         )
+    if load:
+        # Pre-flight the target profile before unloading the working model: a
+        # missing or unreadable GGUF must not cause avoidable downtime.
+        target = settings.llamacpp_model_map.get(model_id)
+        if target is None and model_id == default_id:
+            target = settings.llamacpp_model
+        target_path = Path(target).expanduser() if target else None
+        if target_path is None or not target_path.is_file():
+            scheduler.end_runtime_maintenance()
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "MODEL_FILE_MISSING",
+                        "message": (
+                            f"The configured GGUF for '{model_id}' is missing or not a file; "
+                            "the current model was left loaded"
+                        ),
+                    }
+                },
+            )
     try:
         if load:
             current_id = runtime.active_model_id
@@ -549,8 +570,22 @@ async def _stream(
                 # llama.cpp streams OpenAI-format chunks verbatim, including
                 # its own terminal `data: [DONE]` sentinel; only append the
                 # gateway sentinel when the backend did not send one (GW-21).
-                if line.strip() == "[DONE]":
+                stripped = line.strip()
+                if stripped == "[DONE]":
                     openai_done_sent = True
+                    yield f"data: {line}\n\n"
+                    continue
+                if not include_usage and '"usage"' in stripped:
+                    # The backend is always asked for a usage chunk so the
+                    # gateway can meter tokens (see LlamaCppBackend.stream).
+                    # Clients that did not set stream_options.include_usage
+                    # must not receive the usage-only chunk (OpenAI contract).
+                    try:
+                        event = json.loads(stripped)
+                    except (TypeError, ValueError):
+                        event = None
+                    if isinstance(event, dict) and event.get("usage") and not event.get("choices"):
+                        continue
                 yield f"data: {line}\n\n"
     except InferenceError as exc:
         # Once SSE headers are committed, communicate backend failures as an

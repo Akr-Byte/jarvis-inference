@@ -17,6 +17,19 @@ def test_settings_parse_environment(monkeypatch) -> None:
     assert settings.ollama_models == settings.inference_models
 
 
+def test_settings_treat_empty_numeric_values_as_defaults(monkeypatch) -> None:
+    """Templated .env files frequently leave numeric values blank."""
+    monkeypatch.setenv("MAX_CONCURRENT_REQUESTS", "")
+    monkeypatch.setenv("LLAMACPP_THREADS", "  ")
+    monkeypatch.setenv("QUEUE_TIMEOUT_SECONDS", "")
+
+    settings = Settings()
+
+    assert settings.max_concurrent_requests == 1
+    assert settings.llamacpp_threads >= 1
+    assert settings.queue_timeout_seconds == 90.0
+
+
 def test_settings_enforce_safe_minimums(monkeypatch) -> None:
     monkeypatch.setenv("MAX_CONCURRENT_REQUESTS", "0")
     monkeypatch.setenv("MAX_QUEUE_SIZE", "-1")

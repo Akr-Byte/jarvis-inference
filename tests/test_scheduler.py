@@ -590,6 +590,77 @@ def test_context_admission_supports_128k_and_reserves_output(monkeypatch) -> Non
         )
 
 
+class TokenCountingBackend(FakeBackend):
+    def __init__(self) -> None:
+        self.counts = 0
+
+    async def count_chat_tokens(self, model: str, payload: dict) -> int:
+        self.counts += 1
+        return 1
+
+
+@pytest.mark.asyncio
+async def test_context_admission_skips_tokenizer_far_below_window(
+    monkeypatch, scheduler: Scheduler
+) -> None:
+    """The extra engine tokenization round-trip only runs near the limit."""
+    monkeypatch.setattr(settings, "max_context_length", 8192)
+    monkeypatch.setattr(settings, "max_output_tokens", 512)
+    backend = TokenCountingBackend()
+    scheduler._ollama = backend
+
+    await scheduler.chat(
+        {"model": "qwen3:1.7b", "messages": [{"role": "user", "content": "hello"}]}
+    )
+
+    assert backend.counts == 0
+
+
+@pytest.mark.asyncio
+async def test_context_admission_uses_tokenizer_near_window(
+    monkeypatch, scheduler: Scheduler
+) -> None:
+    monkeypatch.setattr(settings, "max_context_length", 1024)
+    monkeypatch.setattr(settings, "max_output_tokens", 64)
+    backend = TokenCountingBackend()
+    scheduler._ollama = backend
+
+    await scheduler.chat(
+        {"model": "qwen3:1.7b", "messages": [{"role": "user", "content": "x" * 4000}]}
+    )
+
+    assert backend.counts == 1
+
+
+@pytest.mark.asyncio
+async def test_active_model_gauge_tracks_concurrency(monkeypatch, scheduler: Scheduler) -> None:
+    class BarrierBackend(FakeBackend):
+        def __init__(self) -> None:
+            self.seen: list[int] = []
+            self._arrived = 0
+            self._both_running = asyncio.Event()
+
+        async def chat(self, model: str, payload: dict) -> dict:
+            self.seen.append(ACTIVE_MODEL.labels(model=model)._value.get())
+            self._arrived += 1
+            if self._arrived >= 2:
+                self._both_running.set()
+            await self._both_running.wait()
+            return await super().chat(model, payload)
+
+    backend = BarrierBackend()
+    scheduler._ollama = backend
+    scheduler._semaphore = asyncio.Semaphore(2)
+
+    await asyncio.gather(
+        scheduler.chat({"model": "qwen3:1.7b", "messages": []}),
+        scheduler.chat({"model": "qwen3:1.7b", "messages": []}),
+    )
+
+    assert max(backend.seen) == 2
+    assert ACTIVE_MODEL.labels(model="qwen3:1.7b")._value.get() == 0
+
+
 def test_context_heuristic_handles_multilingual_and_code_as_estimates(monkeypatch) -> None:
     monkeypatch.setattr(settings, "max_context_length", 8192)
     monkeypatch.setattr(settings, "max_output_tokens", 512)

@@ -177,10 +177,18 @@ surface). Highlights:
 | `LLAMACPP_MODEL` / `LLAMACPP_ALIAS` | *(empty)* | GGUF file or first split shard, and public model ID. |
 | `LLAMACPP_MODEL_MAP` | *(empty)* | Optional `id=/path/model.gguf;id2=/path/other.gguf` profiles for managed model switching. |
 | `MODEL_DIRECTORY` | `~/models` | Root recursively scanned for GGUFs and complete split sets. |
-| `LLAMACPP_THREADS` / `LLAMACPP_BATCH_SIZE` / `LLAMACPP_UBATCH_SIZE` | `8` / `512` / `128` | llama.cpp CPU and batch tuning. |
-| `LLAMACPP_BATCH_THREADS` / `LLAMACPP_PARALLEL` | `8` / `1` | Batch CPU threads and llama-server slots. |
+| `LLAMACPP_THREADS` / `LLAMACPP_BATCH_THREADS` | physical cores | Generation and prompt-processing CPU threads; defaults avoid SMT oversubscription. |
+| `LLAMACPP_BATCH_SIZE` / `LLAMACPP_UBATCH_SIZE` | `512` / `128` | llama.cpp logical batch and micro-batch; larger values trade memory for prefill throughput. |
+| `LLAMACPP_PARALLEL` | `1` | llama-server slots; keep `MAX_CONCURRENT_REQUESTS <= LLAMACPP_PARALLEL`. |
+| `LLAMACPP_GPU_LAYERS` | `0` | Layers offloaded to a GPU build; `99` offloads everything on a discrete GPU. |
+| `LLAMACPP_JINJA` | `true` | Use the model's own chat template (tool calls, roles, reasoning extraction). |
+| `LLAMACPP_METRICS` | `true` | Expose llama-server's Prometheus endpoint (slot/cache/token telemetry). |
+| `LLAMACPP_MLOCK` | `false` | Lock model weights in RAM on CPU workstations; avoid on memory-constrained hosts. |
+| `LLAMACPP_REASONING_FORMAT` | *(empty)* | `auto`, `none` or `deepseek`; separates reasoning from content in streamed deltas. |
 | `LLAMACPP_CACHE_PROMPT` / `LLAMACPP_CACHE_RAM_MIB` | `true` / `0` | Prompt-cache switch and optional RAM bound. |
-| `LLAMACPP_CACHE_TYPE_K` / `LLAMACPP_CACHE_TYPE_V` | *(empty)* | Optional quantized KV cache types. |
+| `LLAMACPP_CACHE_REUSE` | `0` | Minimum chunk size (tokens) for prefix reuse between related prompts. |
+| `LLAMACPP_CACHE_TYPE_K` / `LLAMACPP_CACHE_TYPE_V` | *(empty)* | Optional quantized KV cache types; llama.cpp requires flash attention for quantized caches. |
+| `LLAMACPP_STARTUP_TIMEOUT_SECONDS` | `300` | Health-gate deadline for loading a large GGUF. |
 | `LLAMACPP_EMBEDDINGS` | `false` | Enable llama.cpp embedding mode only when the configured model/profile supports it. Ollama embeddings stay enabled by default. |
 | `LLAMACPP_RESTART_ENABLED` / `LLAMACPP_MAX_RESTARTS` | `true` / `5` | Bounded recovery after unexpected child exits. |
 | `OLLAMA_KEEP_ALIVE` | `30m` | Backend model residency. |
@@ -263,6 +271,26 @@ is explicitly an estimate, and backend usage remains the actual usage when provi
 `MAX_CONTEXT_LENGTH` is the per-request context. Managed mode sizes llama-server's total context
 pool as `MAX_CONTEXT_LENGTH * LLAMACPP_PARALLEL`, so each configured slot retains the requested
 per-request context and memory admission accounts for every slot.
+
+Engine tuning compared with direct `llama-server` use:
+
+- `--jinja` (default on) keeps the model's chat template, which is what makes tool calling,
+  role handling and reasoning separation behave like other OpenAI-compatible engines. Disabling it
+  is advertised as a degraded configuration at startup.
+- Token accounting asks the engine for a terminal usage chunk on every stream, so the gateway can
+  meter completion tokens even when the client did not set `stream_options.include_usage`; the
+  usage-only chunk is forwarded only to clients that opted in.
+- Exact tokenizer-based context admission is only performed near the window (80% or more of the
+  context plus output budget). Shorter prompts use the heuristic and skip the extra engine
+  round-trip, which keeps time-to-first-token low for long conversations.
+- Model discovery caches parsed GGUF headers by path, size and modification time and skips
+  materialising tokenizer vocabulary arrays, so registry and status endpoints no longer re-parse
+  every model on each request (a 150k-token vocabulary alone costs ~20 ms per scan).
+- Gateway concurrency should match `LLAMACPP_PARALLEL`; a mismatch is reported at startup because
+  excess requests would otherwise queue inside `llama-server` and hit gateway timeouts instead of a
+  clean `429`.
+- Managed mode binds `llama-server` to loopback by default. The engine has no authentication of its
+  own, so binding it to a public interface bypasses gateway auth, admission and queueing.
 
 The constrained Ollama example is [.env.constrained-homelab.example](.env.constrained-homelab.example).
 It keeps 8K context, one active generation and the existing Ollama backend. The installer creates

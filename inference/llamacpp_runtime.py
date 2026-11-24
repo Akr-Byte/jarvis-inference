@@ -26,13 +26,21 @@ OPTIONAL_FLAGS = {
     "--alias": "alias",
     "--cache-prompt": "prompt_cache",
     "--cache-ram": "cache_ram_limit",
+    "--cache-reuse": "cache_reuse",
     "--cache-type-k": "kv_cache_type_k",
     "--cache-type-v": "kv_cache_type_v",
     "--flash-attn": "flash_attention",
+    "--jinja": "jinja",
+    "--metrics": "metrics",
+    "--mlock": "mlock",
+    "--n-gpu-layers": "gpu_layers",
     "--parallel": "parallel_slots",
+    "--reasoning-format": "reasoning_format",
     "--threads-batch": "batch_threads",
     "--embedding": "embeddings",
 }
+# Cache types that llama.cpp treats as an f16 cache (no quantization).
+UNQUANTIZED_CACHE_TYPES = frozenset({"", "f16", "f32", "bf16"})
 
 
 class RuntimeState(StrEnum):
@@ -238,13 +246,31 @@ class LlamaCppRuntime:
             "--ubatch-size",
             str(settings.llamacpp_ubatch_size),
         ]
-        optional: list[tuple[str, str | None, str]] = [
+        switches: list[tuple[str, bool, str]] = [
+            ("--cache-prompt", settings.llamacpp_cache_prompt, "prompt_cache"),
+            ("--jinja", settings.llamacpp_jinja, "jinja"),
+            ("--metrics", settings.llamacpp_metrics, "metrics"),
+            ("--mlock", settings.llamacpp_mlock, "mlock"),
+            ("--embedding", settings.llamacpp_embeddings, "embeddings"),
+        ]
+        reasoning_format = settings.llamacpp_reasoning_format
+        if reasoning_format and reasoning_format not in {"auto", "none", "deepseek"}:
+            logger.warning(
+                "ignoring unsupported LLAMACPP_REASONING_FORMAT=%r; use auto, none or deepseek",
+                reasoning_format,
+            )
+            reasoning_format = ""
+        valued: list[tuple[str, str | None, str]] = [
             ("--alias", self.active_model_id or settings.llamacpp_alias or None, "alias"),
-            ("--cache-prompt", None, "prompt_cache"),
             (
                 "--cache-ram",
                 str(settings.llamacpp_cache_ram_mib) if settings.llamacpp_cache_ram_mib else None,
                 "cache_ram_limit",
+            ),
+            (
+                "--cache-reuse",
+                str(settings.llamacpp_cache_reuse) if settings.llamacpp_cache_reuse else None,
+                "cache_reuse",
             ),
             ("--cache-type-k", settings.llamacpp_cache_type_k or None, "kv_cache_type_k"),
             ("--cache-type-v", settings.llamacpp_cache_type_v or None, "kv_cache_type_v"),
@@ -253,27 +279,34 @@ class LlamaCppRuntime:
                 "auto" if settings.llamacpp_flash_attention else None,
                 "flash_attention",
             ),
+            (
+                "--n-gpu-layers",
+                str(settings.llamacpp_gpu_layers) if settings.llamacpp_gpu_layers else None,
+                "gpu_layers",
+            ),
             ("--parallel", str(settings.llamacpp_parallel), "parallel_slots"),
+            ("--reasoning-format", reasoning_format or None, "reasoning_format"),
             ("--threads-batch", str(settings.llamacpp_batch_threads), "batch_threads"),
-            ("--embedding", None, "embeddings"),
         ]
-        for flag, value, capability in optional:
-            enabled = (
-                value is not None
-                or (flag == "--cache-prompt" and settings.llamacpp_cache_prompt)
-                or (flag == "--embedding" and settings.llamacpp_embeddings)
-            )
-            if not enabled:
-                continue
-            if self.supported_flags is not None and flag not in self.supported_flags:
-                logger.warning(
-                    "llama-server does not support configured optional feature %s", capability
-                )
+        for flag, enabled, capability in switches:
+            if not enabled or not self._flag_supported(flag, capability):
                 continue
             cmd.append(flag)
-            if value is not None:
-                cmd.append(value)
+        for flag, value, capability in valued:
+            if value is None or not self._flag_supported(flag, capability):
+                continue
+            cmd.extend((flag, value))
         return cmd
+
+    def _flag_supported(self, flag: str, capability: str) -> bool:
+        if self.supported_flags is None or flag in self.supported_flags:
+            return True
+        logger.warning(
+            "llama-server does not support configured optional feature %s (%s); skipping",
+            capability,
+            flag,
+        )
+        return False
 
     async def start(self, model_id: str | None = None) -> None:
         if not settings.llamacpp_managed:
@@ -652,13 +685,28 @@ class LlamaCppRuntime:
             "kv_cache_type_v": None if supported is None else "--cache-type-v" in supported,
             "flash_attention": None if supported is None else "--flash-attn" in supported,
             "parallel_slots": None if supported is None else "--parallel" in supported,
+            "jinja": None if supported is None else "--jinja" in supported,
+            "engine_metrics": None if supported is None else "--metrics" in supported,
+            "mlock": None if supported is None else "--mlock" in supported,
+            "gpu_layers": None if supported is None else "--n-gpu-layers" in supported,
+            "cache_reuse": None if supported is None else "--cache-reuse" in supported,
+            "reasoning_format": None if supported is None else "--reasoning-format" in supported,
             "embeddings": (
                 settings.llamacpp_embeddings and (supported is None or "--embedding" in supported)
             ),
+            "threads": settings.llamacpp_threads,
+            "batch_threads": settings.llamacpp_batch_threads,
+            "parallel": settings.llamacpp_parallel,
             "cache_telemetry": False,
+            "engine_metrics_url": (
+                f"http://{settings.llamacpp_host}:{settings.llamacpp_port}/metrics"
+                if settings.llamacpp_metrics and settings.llamacpp_base_url
+                else None
+            ),
             "configured_cache": {
                 "prompt_cache": settings.llamacpp_cache_prompt,
                 "cache_ram_mib": settings.llamacpp_cache_ram_mib,
+                "cache_reuse": settings.llamacpp_cache_reuse,
                 "kv_cache_type_k": settings.llamacpp_cache_type_k or "f16",
                 "kv_cache_type_v": settings.llamacpp_cache_type_v or "f16",
             },
@@ -666,6 +714,73 @@ class LlamaCppRuntime:
 
 
 runtime = LlamaCppRuntime()
+
+
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def validate_runtime_tuning() -> None:
+    """Warn about engine configurations that silently hurt throughput or safety.
+
+    Startup stays permissive: an operator may deliberately run an unusual
+    profile, but every known footgun is surfaced once in the gateway log.
+    """
+    if not settings.llamacpp_base_url:
+        return
+    if settings.llamacpp_managed and settings.llamacpp_host not in LOOPBACK_HOSTS:
+        logger.warning(
+            "managed llama-server is bound to %s without authentication; the OpenAI endpoint "
+            "bypasses gateway auth, admission and queueing. Bind 127.0.0.1 or firewall the port",
+            settings.llamacpp_host,
+        )
+    if settings.llamacpp_batch_size < settings.llamacpp_ubatch_size:
+        logger.warning(
+            "LLAMACPP_BATCH_SIZE (%s) is smaller than LLAMACPP_UBATCH_SIZE (%s); "
+            "llama.cpp may refuse to start",
+            settings.llamacpp_batch_size,
+            settings.llamacpp_ubatch_size,
+        )
+    if settings.max_concurrent_requests > settings.llamacpp_parallel:
+        logger.warning(
+            "MAX_CONCURRENT_REQUESTS (%s) exceeds LLAMACPP_PARALLEL (%s); excess requests will "
+            "queue inside llama-server and may hit gateway timeouts instead of a clean 429",
+            settings.max_concurrent_requests,
+            settings.llamacpp_parallel,
+        )
+    logical = psutil.cpu_count(logical=True) or 1
+    if settings.llamacpp_threads > logical:
+        logger.warning(
+            "LLAMACPP_THREADS (%s) exceeds the %s logical CPUs; threading above the physical core "
+            "count usually reduces tokens/s",
+            settings.llamacpp_threads,
+            logical,
+        )
+    if settings.llamacpp_parallel > 1 and settings.max_concurrent_requests <= 1:
+        logger.warning(
+            "LLAMACPP_PARALLEL is %s but MAX_CONCURRENT_REQUESTS is %s; the extra llama.cpp "
+            "slots cannot be used and the KV cache is reserved for them",
+            settings.llamacpp_parallel,
+            settings.max_concurrent_requests,
+        )
+    quantized = [
+        f"{name}={value}"
+        for name, value in (
+            ("LLAMACPP_CACHE_TYPE_K", settings.llamacpp_cache_type_k),
+            ("LLAMACPP_CACHE_TYPE_V", settings.llamacpp_cache_type_v),
+        )
+        if value and value.lower() not in UNQUANTIZED_CACHE_TYPES
+    ]
+    if quantized and not settings.llamacpp_flash_attention:
+        logger.warning(
+            "quantized KV cache (%s) requires flash attention in llama.cpp; set "
+            "LLAMACPP_FLASH_ATTENTION=true or keep an f16 cache, otherwise the engine may exit",
+            ", ".join(quantized),
+        )
+    if settings.llamacpp_managed and not settings.llamacpp_jinja:
+        logger.warning(
+            "LLAMACPP_JINJA=false disables the model chat template: tool calls, reasoning "
+            "extraction and role handling degrade compared with other OpenAI engines"
+        )
 
 
 def require_memory_capacity(estimate: MemoryEstimate, *, estimate_bytes: int | None = None) -> None:

@@ -81,6 +81,49 @@ async def test_llamacpp_token_count_falls_back_when_server_route_is_unavailable(
 
 
 @pytest.mark.asyncio
+async def test_llamacpp_stream_requests_usage_for_token_accounting(monkeypatch) -> None:
+    class StreamResponse:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        async def aiter_lines(self):
+            yield 'data: {"choices":[{"delta":{"content":"hi"}}]}'
+            yield "data: [DONE]"
+
+    class StreamContext:
+        async def __aenter__(self):
+            return StreamResponse()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class StreamClient:
+        request = None
+
+        def stream(self, method, url, json):
+            self.request = (method, url, json)
+            return StreamContext()
+
+    monkeypatch.setattr("inference.backends.llamacpp.settings.llamacpp_url", "http://llama")
+    backend = LlamaCppBackend()
+    client = StreamClient()
+    backend._client = client
+
+    lines = [
+        line
+        async for line in backend.stream(
+            "coder", {"messages": [], "stream_options": {"include_usage": False}}
+        )
+    ]
+
+    assert lines == ['{"choices":[{"delta":{"content":"hi"}}]}', "[DONE]"]
+    assert client.request[2]["stream_options"]["include_usage"] is True
+    assert client.request[2]["stream"] is True
+
+
+@pytest.mark.asyncio
 async def test_llamacpp_health_is_false_when_not_configured(monkeypatch) -> None:
     monkeypatch.setattr("inference.backends.llamacpp.settings.llamacpp_url", "")
     backend = LlamaCppBackend()

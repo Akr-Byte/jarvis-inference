@@ -460,6 +460,61 @@ def test_llamacpp_stream_does_not_duplicate_done_sentinel(monkeypatch) -> None:
     assert response.text.count("data: [DONE]") == 1
 
 
+_USAGE_ONLY_CHUNK = json.dumps(
+    {
+        "choices": [],
+        "usage": {"prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 12},
+    }
+)
+
+
+def test_llamacpp_stream_suppresses_usage_chunk_client_did_not_request(monkeypatch) -> None:
+    """The engine always reports usage for metering; clients opt in to seeing it."""
+    from inference.config import settings
+
+    _prepare_stream_stub(
+        monkeypatch,
+        ['{"choices":[{"delta":{"content":"hi"}}]}', _USAGE_ONLY_CHUNK, "[DONE]"],
+    )
+    monkeypatch.setattr(settings, "llamacpp_url", "http://llama")
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "qwen3:1.7b",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert '"usage"' not in response.text
+    assert "hi" in response.text
+    assert response.text.count("data: [DONE]") == 1
+
+
+def test_llamacpp_stream_forwards_usage_chunk_when_requested(monkeypatch) -> None:
+    from inference.config import settings
+
+    _prepare_stream_stub(
+        monkeypatch,
+        ['{"choices":[{"delta":{"content":"hi"}}]}', _USAGE_ONLY_CHUNK, "[DONE]"],
+    )
+    monkeypatch.setattr(settings, "llamacpp_url", "http://llama")
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "qwen3:1.7b",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        },
+    )
+
+    assert response.status_code == 200
+    assert '"usage"' in response.text
+    assert response.text.count("data: [DONE]") == 1
+
+
 def test_invalid_request_id_is_replaced(monkeypatch) -> None:
     """GW-13: echoed request ids must be bounded and header-safe."""
 
@@ -523,8 +578,6 @@ def test_chunked_request_without_length_is_rejected() -> None:
     """GW-5: chunked bodies would bypass the content-length cap."""
     import asyncio
 
-    from starlette.requests import Request
-
     from inference.main import BodyLimitMiddleware
 
     scope = {
@@ -535,12 +588,21 @@ def test_chunked_request_without_length_is_rejected() -> None:
         "query_string": b"",
     }
 
-    async def call_next(_request):
+    async def app(scope, receive, send):
         raise AssertionError("the request must be rejected before routing")
 
     async def run() -> int:
-        middleware = BodyLimitMiddleware(app=None)
-        response = await middleware.dispatch(Request(scope), call_next)
-        return response.status_code
+        sent: list[dict] = []
+
+        async def send(message):
+            sent.append(message)
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        await BodyLimitMiddleware(app)(scope, receive, send)
+        return next(
+            message["status"] for message in sent if message["type"] == "http.response.start"
+        )
 
     assert asyncio.run(run()) == 411

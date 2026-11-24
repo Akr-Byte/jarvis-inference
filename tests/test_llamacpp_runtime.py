@@ -35,6 +35,66 @@ def test_managed_command_carries_workstation_tuning(monkeypatch, tmp_path) -> No
     assert command[command.index("--cache-type-k") + 1] == "q8_0"
 
 
+def test_managed_command_passes_engine_parity_flags(monkeypatch, tmp_path) -> None:
+    """Chat templates, metrics, mlock and reasoning separation are opt-in flags."""
+    runtime = LlamaCppRuntime()
+    monkeypatch.setattr(settings, "llamacpp_model", str(tmp_path / "model.gguf"))
+    monkeypatch.setattr(settings, "llamacpp_alias", "parity")
+    monkeypatch.setattr(settings, "llamacpp_jinja", True)
+    monkeypatch.setattr(settings, "llamacpp_metrics", True)
+    monkeypatch.setattr(settings, "llamacpp_mlock", True)
+    monkeypatch.setattr(settings, "llamacpp_reasoning_format", "auto")
+    monkeypatch.setattr(settings, "llamacpp_cache_reuse", 256)
+    monkeypatch.setattr(settings, "llamacpp_gpu_layers", 99)
+    runtime.supported_flags = {
+        "--model",
+        "--host",
+        "--port",
+        "--ctx-size",
+        "--threads",
+        "--batch-size",
+        "--ubatch-size",
+        "--jinja",
+        "--metrics",
+        "--mlock",
+        "--reasoning-format",
+        "--cache-reuse",
+        "--n-gpu-layers",
+    }
+
+    command = runtime.command()
+
+    assert "--jinja" in command
+    assert "--metrics" in command
+    assert "--mlock" in command
+    assert command[command.index("--reasoning-format") + 1] == "auto"
+    assert command[command.index("--cache-reuse") + 1] == "256"
+    assert command[command.index("--n-gpu-layers") + 1] == "99"
+
+
+def test_managed_command_skips_parity_flags_unsupported_by_engine(monkeypatch, tmp_path) -> None:
+    runtime = LlamaCppRuntime()
+    monkeypatch.setattr(settings, "llamacpp_model", str(tmp_path / "model.gguf"))
+    monkeypatch.setattr(settings, "llamacpp_jinja", True)
+    monkeypatch.setattr(settings, "llamacpp_metrics", True)
+    monkeypatch.setattr(settings, "llamacpp_reasoning_format", "auto")
+    runtime.supported_flags = {
+        "--model",
+        "--host",
+        "--port",
+        "--ctx-size",
+        "--threads",
+        "--batch-size",
+        "--ubatch-size",
+    }
+
+    command = runtime.command()
+
+    assert "--jinja" not in command
+    assert "--metrics" not in command
+    assert "--reasoning-format" not in command
+
+
 @pytest.mark.asyncio
 async def test_unmanaged_runtime_does_not_spawn_or_signal_process(monkeypatch) -> None:
     runtime = LlamaCppRuntime()
@@ -308,6 +368,69 @@ def test_gguf_metadata_reads_model_context(tmp_path) -> None:
         + struct.pack("<II", 4, 131072)
     )
     assert read_metadata(path)["qwen3.context_length"] == 131072
+
+
+def _gguf_string_array(values: list[str]) -> bytes:
+    return struct.pack("<IQ", 8, len(values)) + b"".join(_gguf_string(value) for value in values)
+
+
+def test_gguf_metadata_skips_unwanted_string_arrays(tmp_path) -> None:
+    """Tokenizer vocab arrays must be skipped, not decoded, during header scans."""
+    from inference.gguf import read_metadata
+
+    path = tmp_path / "vocab.gguf"
+    path.write_bytes(
+        b"GGUF"
+        + struct.pack("<IQQ", 3, 0, 3)
+        + _gguf_string("tokenizer.ggml.tokens")
+        + struct.pack("<I", 9)
+        + _gguf_string_array([f"token-{index}" for index in range(2048)])
+        + _gguf_string("general.architecture")
+        + struct.pack("<I", 8)
+        + _gguf_string("llama")
+        + _gguf_string("llama.context_length")
+        + struct.pack("<II", 4, 8192)
+    )
+
+    metadata = read_metadata(path)
+
+    assert metadata["general.architecture"] == "llama"
+    assert metadata["llama.context_length"] == 8192
+    assert "tokenizer.ggml.tokens" not in metadata
+
+
+def test_gguf_metadata_cache_avoids_reparsing_and_invalidates(tmp_path, monkeypatch) -> None:
+    from inference import gguf
+
+    path = tmp_path / "cached.gguf"
+
+    def write(context: int, extra: str | None = None) -> None:
+        entries = (_gguf_string("llama.context_length") + struct.pack("<II", 4, context)) + (
+            _gguf_string(extra) + struct.pack("<I", 8) + _gguf_string("x") if extra else b""
+        )
+        count = 2 if extra else 1
+        path.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, count) + entries)
+
+    calls = 0
+    original = gguf._read_metadata_file
+
+    def counting(source):
+        nonlocal calls
+        calls += 1
+        return original(source)
+
+    gguf._read_metadata_cached.cache_clear()
+    monkeypatch.setattr(gguf, "_read_metadata_file", counting)
+
+    write(4096)
+    assert gguf.read_metadata(path)["llama.context_length"] == 4096
+    assert gguf.read_metadata(path)["llama.context_length"] == 4096
+    assert calls == 1
+
+    write(8192, extra="general.name")
+    assert gguf.read_metadata(path)["llama.context_length"] == 8192
+    assert calls == 2
+    gguf._read_metadata_cached.cache_clear()
 
 
 def test_qwen3next_hybrid_kv_and_recurrent_state_estimate() -> None:
