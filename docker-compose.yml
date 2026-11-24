@@ -1,38 +1,4 @@
 services:
-  ollama:
-    image: ollama/ollama:0.35.1@sha256:17e945f1aa6e505707eeb621e3f36847d0a4a063d4778f7007645acccfb8bd4f
-    container_name: jarvis-ollama
-    restart: unless-stopped
-    init: true
-    stop_grace_period: 30s
-    environment:
-      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-30m}
-      OLLAMA_MAX_LOADED_MODELS: ${MAX_LOADED_MODELS:-1}
-      OLLAMA_NUM_PARALLEL: "1"
-      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-16384}
-      # Explicit operator knobs from .env (GW-2): without these lines the
-      # recorded CPU-tuning optimum is silently never applied.
-      OLLAMA_NUM_THREADS: ${OLLAMA_NUM_THREADS:-8}
-      OLLAMA_KV_CACHE_TYPE: ${OLLAMA_KV_CACHE_TYPE:-q8_0}
-    volumes:
-      - ollama:/root/.ollama
-    cpus: ${OLLAMA_CPUS:-1.5}
-    mem_limit: ${OLLAMA_MEMORY_LIMIT:-8g}
-    pids_limit: 256
-    security_opt:
-      - no-new-privileges:true
-    logging:
-      driver: json-file
-      options:
-        max-size: 10m
-        max-file: "3"
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
-
   jarvis-inference:
     build:
       context: .
@@ -43,9 +9,6 @@ services:
     stop_grace_period: 30s
     env_file:
       - .env
-    depends_on:
-      ollama:
-        condition: service_healthy
     ports:
       - "${INFERENCE_BIND_ADDRESS:-127.0.0.1}:${INFERENCE_PORT:-8080}:8080"
     cpus: ${INFERENCE_CPUS:-0.4}
@@ -62,8 +25,7 @@ services:
         max-size: 10m
         max-file: "3"
     environment:
-      OLLAMA_URL: http://ollama:11434
-      INFERENCE_BACKEND: ${INFERENCE_BACKEND:-ollama}
+      INFERENCE_BACKEND: llamacpp
       INFERENCE_HOST: 0.0.0.0
       INFERENCE_PORT: "8080"
       # llama.cpp managed backend (set INFERENCE_BACKEND=llamacpp and provide
@@ -83,4 +45,3 @@ services:
       start_period: 25s
 
 volumes:
-  ollama:
