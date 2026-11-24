@@ -20,8 +20,11 @@ class OllamaBackend:
             connect=min(10.0, settings.backend_http_timeout_seconds),
         )
         limits = httpx.Limits(
-            max_connections=2,
-            max_keepalive_connections=1,
+            # Permit one connection per backend slot plus a short-headroom
+            # spare, so gateway-level concurrency is never serialized inside
+            # the HTTP pool.
+            max_connections=max(4, settings.max_concurrent_requests + 2),
+            max_keepalive_connections=max(2, settings.max_concurrent_requests),
             keepalive_expiry=30.0,
         )
         self._client = httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=False)
