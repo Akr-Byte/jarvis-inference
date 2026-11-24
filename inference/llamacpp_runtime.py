@@ -30,6 +30,8 @@ OPTIONAL_FLAGS = {
     "--cache-type-k": "kv_cache_type_k",
     "--cache-type-v": "kv_cache_type_v",
     "--draft-model": "draft_model",
+    "--draft-max-len": "draft_max_len",
+    "--draft-min-len": "draft_min_len",
     "--flash-attn": "flash_attention",
     "--jinja": "jinja",
     "--metrics": "metrics",
@@ -300,6 +302,10 @@ class LlamaCppRuntime:
         if settings.llamacpp_draft_model:
             if self._flag_supported("--draft-model", "draft_model"):
                 cmd.extend(("--draft-model", settings.llamacpp_draft_model))
+            if self._flag_supported("--draft-max-len", "draft_max_len"):
+                cmd.extend(("--draft-max-len", str(settings.llamacpp_draft_max_len)))
+            if self._flag_supported("--draft-min-len", "draft_min_len"):
+                cmd.extend(("--draft-min-len", str(settings.llamacpp_draft_min_len)))
         return cmd
 
     def _flag_supported(self, flag: str, capability: str) -> bool:
@@ -696,6 +702,8 @@ class LlamaCppRuntime:
             "cache_reuse": None if supported is None else "--cache-reuse" in supported,
             "reasoning_format": None if supported is None else "--reasoning-format" in supported,
             "draft_model": None if supported is None else "--draft-model" in supported,
+            "draft_max_len": None if supported is None else "--draft-max-len" in supported,
+            "draft_min_len": None if supported is None else "--draft-min-len" in supported,
             "embeddings": (
                 settings.llamacpp_embeddings and (supported is None or "--embedding" in supported)
             ),

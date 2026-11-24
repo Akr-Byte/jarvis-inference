@@ -199,6 +199,14 @@ class Settings:
     llamacpp_draft_model: str = field(
         default_factory=lambda: os.getenv("LLAMACPP_DRAFT_MODEL", "").strip()
     )
+    # Speculative-decoding sampling bounds; emitted only when a draft model is
+    # configured. Lower bounds start drafting earlier; both must be positive.
+    llamacpp_draft_max_len: int = field(
+        default_factory=lambda: max(1, _int("LLAMACPP_DRAFT_MAX_LEN", 5))
+    )
+    llamacpp_draft_min_len: int = field(
+        default_factory=lambda: max(1, _int("LLAMACPP_DRAFT_MIN_LEN", 5))
+    )
     # Minimum chunk size (tokens) for prefix reuse between related prompts;
     # 0 disables the extra reuse pass.
     llamacpp_cache_reuse: int = field(

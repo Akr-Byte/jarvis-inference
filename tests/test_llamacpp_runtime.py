@@ -588,6 +588,8 @@ def test_managed_command_passes_speculative_decoding_flag(monkeypatch, tmp_path)
     runtime = LlamaCppRuntime()
     monkeypatch.setattr(settings, "llamacpp_model", str(tmp_path / "model.gguf"))
     monkeypatch.setattr(settings, "llamacpp_draft_model", "/models/draft-Qwen3-1.5B.gguf")
+    monkeypatch.setattr(settings, "llamacpp_draft_max_len", 7)
+    monkeypatch.setattr(settings, "llamacpp_draft_min_len", 3)
     runtime.supported_flags = {
         "--model",
         "--host",
@@ -597,18 +599,24 @@ def test_managed_command_passes_speculative_decoding_flag(monkeypatch, tmp_path)
         "--batch-size",
         "--ubatch-size",
         "--draft-model",
+        "--draft-max-len",
+        "--draft-min-len",
     }
 
     command = runtime.command()
 
     assert "--draft-model" in command
     assert command[command.index("--draft-model") + 1] == "/models/draft-Qwen3-1.5B.gguf"
+    assert command[command.index("--draft-max-len") + 1] == "7"
+    assert command[command.index("--draft-min-len") + 1] == "3"
 
 
 def test_managed_command_skips_draft_flag_when_unsupported(monkeypatch, tmp_path) -> None:
     runtime = LlamaCppRuntime()
     monkeypatch.setattr(settings, "llamacpp_model", str(tmp_path / "model.gguf"))
     monkeypatch.setattr(settings, "llamacpp_draft_model", "/models/draft-Qwen3-1.5B.gguf")
+    monkeypatch.setattr(settings, "llamacpp_draft_max_len", 7)
+    monkeypatch.setattr(settings, "llamacpp_draft_min_len", 3)
     runtime.supported_flags = {
         "--model",
         "--host",
@@ -622,16 +630,22 @@ def test_managed_command_skips_draft_flag_when_unsupported(monkeypatch, tmp_path
     command = runtime.command()
 
     assert "--draft-model" not in command
+    assert "--draft-max-len" not in command
+    assert "--draft-min-len" not in command
 
 
-def test_managed_command_omits_draft_flag_when_unset(monkeypatch, tmp_path) -> None:
+def test_managed_command_omits_draft_flags_when_unset(monkeypatch, tmp_path) -> None:
     runtime = LlamaCppRuntime()
     monkeypatch.setattr(settings, "llamacpp_model", str(tmp_path / "model.gguf"))
     monkeypatch.setattr(settings, "llamacpp_draft_model", "")
+    monkeypatch.setattr(settings, "llamacpp_draft_max_len", 7)
+    monkeypatch.setattr(settings, "llamacpp_draft_min_len", 3)
 
     command = runtime.command()
 
     assert "--draft-model" not in command
+    assert "--draft-max-len" not in command
+    assert "--draft-min-len" not in command
 
 
 def test_llamacpp_capabilities_expose_draft_model(monkeypatch) -> None:
@@ -644,6 +658,8 @@ def test_llamacpp_capabilities_expose_draft_model(monkeypatch) -> None:
 
     capabilities = runtime.capabilities()
     assert capabilities["draft_model"] is False
+    assert capabilities["draft_max_len"] is False
+    assert capabilities["draft_min_len"] is False
     assert capabilities["engine_metrics_url"].endswith("/metrics")
 
 

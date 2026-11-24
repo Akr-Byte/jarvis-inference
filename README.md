@@ -182,6 +182,7 @@ surface). Highlights:
 | `LLAMACPP_PARALLEL` | `1` | llama-server slots; keep `MAX_CONCURRENT_REQUESTS <= LLAMACPP_PARALLEL`. |
 | `LLAMACPP_GPU_LAYERS` | `0` | Layers offloaded to a GPU build; `99` offloads everything on a discrete GPU. |
 | `LLAMACPP_DRAFT_MODEL` | *(empty)* | Optional speculative-decoding draft GGUF path; enables `--draft-model` when the build supports it. |
+| `LLAMACPP_DRAFT_MAX_LEN` / `LLAMACPP_DRAFT_MIN_LEN` | `5` / `5` | Speculative-decoding draft sampling bounds; emitted only when a draft model is configured. |
 | `LLAMACPP_JINJA` | `true` | Use the model's own chat template (tool calls, roles, reasoning extraction). |
 | `LLAMACPP_METRICS` | `true` | Expose llama-server's Prometheus endpoint (slot/cache/token telemetry). |
 | `LLAMACPP_MLOCK` | `false` | Lock model weights in RAM on CPU workstations; avoid on memory-constrained hosts. |
@@ -299,6 +300,10 @@ CPU-only performance tuning (recommended for the native workstation profile):
   model) to enable speculative decoding. It maps to llama-server's `--draft-model` when the build
   supports it; startup skips the flag with a warning when it does not. Draft-then-verify sampling is
   the largest single lever for CPU-only token generation (often 2-3x on supported models).
+- Tune `LLAMACPP_DRAFT_MAX_LEN` (default 5) and `LLAMACPP_DRAFT_MIN_LEN` (default 5) when a draft
+  model is configured; they map to `--draft-max-len` / `--draft-min-len` and only take effect with
+  `--draft-model`. Raise the draft horizon for longer generations, or raise the minimum draft length
+  when the draft model is high quality enough to skip early verification cycles.
 - Keep `LLAMACPP_CACHE_TYPE_K` / `LLAMACPP_CACHE_TYPE_V` at a quantized type such as `q8_0` with
   `LLAMACPP_FLASH_ATTENTION=true`; quantized KV halves cache memory bandwidth, which speeds both
   prefill reuse and decode.
