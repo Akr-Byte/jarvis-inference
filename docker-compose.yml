@@ -7,8 +7,6 @@ services:
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
-    volumes:
-      - ./models:/models:ro
     ports:
       - "8081:8080"
     healthcheck:
@@ -22,9 +20,7 @@ services:
       - LLAMA_PORT=8080
 
   jarvis-inference:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
+    image: jarvis-inference-jarvis-inference
     container_name: jarvis-inference
     restart: unless-stopped
     init: true
