@@ -123,6 +123,12 @@
 - Enabling `LLAMACPP_EMBEDDINGS` with an external engine now logs a warning that `--embedding` must
   be supplied through `LLAMA_EXTRA_ARGS`; the thread-oversubscription warning is limited to managed
   mode, where gateway affinity actually describes the engine process.
+- All three images now declare a non-root `USER`, clearing Trivy `DS-0002` in the security workflow;
+  the gateway, engine and Ollama containers were verified to start and serve as `appuser`.
+- The release workflow builds the root `Dockerfile` instead of the deleted `docker/Dockerfile`, so
+  tag-triggered image publishing works with the modular image layout.
+- Ruff no longer flags the forward reference in the discovery cache annotation, and the formatter
+  check passes across the tree.
 
 ## 0.5.1
 

@@ -142,9 +142,7 @@ def _compact_payload(
         return None
     compacted = dict(payload)
     compacted["messages"] = compacted_messages
-    compacted_tokens = estimate_prompt_tokens(
-        _prompt_payload(compacted) or compacted_messages
-    )
+    compacted_tokens = estimate_prompt_tokens(_prompt_payload(compacted) or compacted_messages)
     if compacted_tokens + output_budget > effective:
         return None
     return compacted
@@ -240,9 +238,7 @@ async def _admit_context_window(payload: dict[str, Any], backend: Any) -> dict[s
         if candidate is not None:
             verified = await tokenizer(model, candidate)
             if verified is not None and verified + output_budget <= effective:
-                CONTEXT_USAGE.labels(model=model).observe(
-                    (verified + output_budget) / effective
-                )
+                CONTEXT_USAGE.labels(model=model).observe((verified + output_budget) / effective)
                 return candidate
     # A heuristic must not re-admit a prompt the engine's tokenizer rejected;
     # when no exact count is available, the heuristic is still the best signal.

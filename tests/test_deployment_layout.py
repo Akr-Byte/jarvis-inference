@@ -1,3 +1,4 @@
+import re
 import subprocess
 from pathlib import Path
 
@@ -22,6 +23,30 @@ def test_install_script_has_valid_shell_syntax() -> None:
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_release_workflow_builds_an_existing_dockerfile() -> None:
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    referenced = re.findall(r"^\s*file:\s*(\S+)\s*$", release, re.MULTILINE)
+    assert referenced, "release workflow must build a container image"
+    for dockerfile in referenced:
+        assert (ROOT / dockerfile).is_file(), f"release references missing {dockerfile}"
+
+
+def test_dockerfiles_run_as_non_root() -> None:
+    dockerfiles = [
+        ROOT / "Dockerfile",
+        ROOT / "modules" / "llama" / "Dockerfile",
+        ROOT / "modules" / "ollama" / "Dockerfile",
+    ]
+    for dockerfile in dockerfiles:
+        directives = [
+            line.strip()
+            for line in dockerfile.read_text(encoding="utf-8").splitlines()
+            if line.strip().upper().startswith("USER ")
+        ]
+        assert directives, f"{dockerfile.name} must declare USER for Trivy DS-0002"
+        assert all("root" not in d.lower() for d in directives), directives
 
 
 def test_remote_gateway_configuration_is_documented() -> None:

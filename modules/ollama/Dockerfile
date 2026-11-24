@@ -10,6 +10,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Run the service as an unprivileged user (Trivy DS-0002, defense in depth).
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
+
 # Ollama will be installed and configured at runtime
 # The entrypoint sets up the ollama service
 CMD ["ollama", "serve"]

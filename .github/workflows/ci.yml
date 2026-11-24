@@ -21,6 +21,7 @@ jobs:
       - run: python -m ruff check .
       - run: python -m ruff format --check .
       - run: bash -n scripts/*.sh
+      - run: sh -n modules/llama/entrypoint.sh
       - run: python -m pytest -q --cov=inference --cov-report=term-missing --cov-fail-under=70
       - name: Write commit-bound certification manifest
         if: always()

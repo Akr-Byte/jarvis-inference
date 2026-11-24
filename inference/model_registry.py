@@ -17,7 +17,7 @@ QUANT = re.compile(r"(?i)(IQ[1-6]_[A-Z0-9]+|Q[2-8]_[A-Z0-9]+|F16|F32|BF16)")
 # A short TTL avoids repeating a full rglob+stat on every status/metadata
 # request while still noticing models added or removed during operation.
 DISCOVERY_TTL_SECONDS = 2.0
-_discovery_cache: dict[Path, tuple[float, list["DiscoveredModel"]]] = {}
+_discovery_cache: dict[Path, tuple[float, list[DiscoveredModel]]] = {}
 
 
 def invalidate_discovery_cache() -> None:

@@ -25,6 +25,12 @@ RUN apt-get update \
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
+# Run the engine as an unprivileged user (Trivy DS-0002, defense in depth).
+# Models are mounted read-only and llama-server listens on a high port, so no
+# root-owned paths or capabilities are needed at runtime.
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
+
 # Run llama-server with model from volume
 # Environment variables can be overridden at runtime:
 # - LLAMA_MODEL: explicit path to a .gguf file (highest priority)

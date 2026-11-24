@@ -16,6 +16,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY inference/ ./inference/
 
+# Run the gateway as an unprivileged user (Trivy DS-0002, defense in depth).
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
+
 EXPOSE 8080
 
 CMD ["uvicorn", "inference.main:app", "--host", "0.0.0.0", "--port", "8080"]
