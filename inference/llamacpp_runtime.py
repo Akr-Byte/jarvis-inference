@@ -32,6 +32,7 @@ OPTIONAL_FLAGS = {
     "--draft-model": "draft_model",
     "--draft-max-len": "draft_max_len",
     "--draft-min-len": "draft_min_len",
+    "--draft-ctx-size": "draft_ctx_size",
     "--flash-attn": "flash_attention",
     "--jinja": "jinja",
     "--metrics": "metrics",
@@ -317,6 +318,10 @@ class LlamaCppRuntime:
                         str(min(settings.llamacpp_draft_min_len, settings.llamacpp_draft_max_len)),
                     )
                 )
+            if settings.llamacpp_draft_ctx_size and self._flag_supported(
+                "--draft-ctx-size", "draft_ctx_size"
+            ):
+                cmd.extend(("--draft-ctx-size", str(settings.llamacpp_draft_ctx_size)))
         return cmd
 
     def _flag_supported(self, flag: str, capability: str) -> bool:
@@ -724,6 +729,7 @@ class LlamaCppRuntime:
             "draft_model": None if supported is None else "--draft-model" in supported,
             "draft_max_len": None if supported is None else "--draft-max-len" in supported,
             "draft_min_len": None if supported is None else "--draft-min-len" in supported,
+            "draft_ctx_size": None if supported is None else "--draft-ctx-size" in supported,
             "embeddings": (
                 settings.llamacpp_embeddings and (supported is None or "--embedding" in supported)
             ),

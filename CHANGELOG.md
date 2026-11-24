@@ -37,6 +37,8 @@
 - Optional speculative-decoding sampling bounds: `LLAMACPP_DRAFT_MAX_LEN` (draft token horizon,
   default 5) and `LLAMACPP_DRAFT_MIN_LEN` (minimum draft length before verification starts, default
   5) map to llama-server `--draft-max-len` / `--draft-min-len` when a draft model is configured.
+- Optional speculative-decoding draft context size: `LLAMACPP_DRAFT_CTX_SIZE` (default 0 = engine
+  default) maps to `--draft-ctx-size` when a draft model is configured and the flag is supported.
 - Exact tokenizer-based context admission only runs near the context limit (>= 80% of prompt plus
   output budget); shorter prompts skip the extra engine round-trip before generation.
 - Streaming requests always ask llama.cpp for a terminal usage chunk so completion tokens are

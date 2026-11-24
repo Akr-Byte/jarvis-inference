@@ -653,6 +653,31 @@ def test_managed_command_passes_speculative_decoding_flag(monkeypatch, tmp_path)
     assert command[command.index("--draft-min-len") + 1] == "3"
 
 
+def test_managed_command_emits_draft_ctx_size_when_set(monkeypatch, tmp_path) -> None:
+    runtime = LlamaCppRuntime()
+    monkeypatch.setattr(settings, "llamacpp_model", str(tmp_path / "model.gguf"))
+    monkeypatch.setattr(settings, "llamacpp_draft_model", "/models/draft-Qwen3-1.5B.gguf")
+    monkeypatch.setattr(settings, "llamacpp_draft_ctx_size", 8192)
+    runtime.supported_flags = {
+        "--model",
+        "--host",
+        "--port",
+        "--ctx-size",
+        "--threads",
+        "--batch-size",
+        "--ubatch-size",
+        "--draft-model",
+        "--draft-max-len",
+        "--draft-min-len",
+        "--draft-ctx-size",
+    }
+
+    command = runtime.command()
+
+    assert "--draft-ctx-size" in command
+    assert command[command.index("--draft-ctx-size") + 1] == "8192"
+
+
 def test_managed_command_skips_draft_flag_when_unsupported(monkeypatch, tmp_path) -> None:
     runtime = LlamaCppRuntime()
     monkeypatch.setattr(settings, "llamacpp_model", str(tmp_path / "model.gguf"))
@@ -682,12 +707,14 @@ def test_managed_command_omits_draft_flags_when_unset(monkeypatch, tmp_path) -> 
     monkeypatch.setattr(settings, "llamacpp_draft_model", "")
     monkeypatch.setattr(settings, "llamacpp_draft_max_len", 7)
     monkeypatch.setattr(settings, "llamacpp_draft_min_len", 3)
+    monkeypatch.setattr(settings, "llamacpp_draft_ctx_size", 0)
 
     command = runtime.command()
 
     assert "--draft-model" not in command
     assert "--draft-max-len" not in command
     assert "--draft-min-len" not in command
+    assert "--draft-ctx-size" not in command
 
 
 def test_llamacpp_capabilities_expose_draft_model(monkeypatch) -> None:
@@ -702,6 +729,7 @@ def test_llamacpp_capabilities_expose_draft_model(monkeypatch) -> None:
     assert capabilities["draft_model"] is False
     assert capabilities["draft_max_len"] is False
     assert capabilities["draft_min_len"] is False
+    assert capabilities["draft_ctx_size"] is False
     assert capabilities["engine_metrics_url"].endswith("/metrics")
 
 

@@ -183,6 +183,7 @@ surface). Highlights:
 | `LLAMACPP_GPU_LAYERS` | `0` | Layers offloaded to a GPU build; `99` offloads everything on a discrete GPU. |
 | `LLAMACPP_DRAFT_MODEL` | *(empty)* | Optional speculative-decoding draft GGUF path; enables `--draft-model` when the build supports it. |
 | `LLAMACPP_DRAFT_MAX_LEN` / `LLAMACPP_DRAFT_MIN_LEN` | `5` / `5` | Speculative-decoding draft sampling bounds; emitted only when a draft model is configured. |
+| `LLAMACPP_DRAFT_CTX_SIZE` | `0` | Optional speculative-decoding draft context size; emits `--draft-ctx-size` only when set. |
 | `LLAMACPP_JINJA` | `true` | Use the model's own chat template (tool calls, roles, reasoning extraction). |
 | `LLAMACPP_METRICS` | `true` | Expose llama-server's Prometheus endpoint (slot/cache/token telemetry). |
 | `LLAMACPP_MLOCK` | `false` | Lock model weights in RAM on CPU workstations; avoid on memory-constrained hosts. |

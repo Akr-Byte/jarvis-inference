@@ -207,6 +207,11 @@ class Settings:
     llamacpp_draft_min_len: int = field(
         default_factory=lambda: max(1, _int("LLAMACPP_DRAFT_MIN_LEN", 5))
     )
+    # Optional context size for the speculative-decoding draft model; 0 keeps
+    # the engine default and only emits --draft-ctx-size when explicitly set.
+    llamacpp_draft_ctx_size: int = field(
+        default_factory=lambda: max(0, _int("LLAMACPP_DRAFT_CTX_SIZE", 0))
+    )
     # Minimum chunk size (tokens) for prefix reuse between related prompts;
     # 0 disables the extra reuse pass.
     llamacpp_cache_reuse: int = field(
