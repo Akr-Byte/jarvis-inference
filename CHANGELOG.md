@@ -31,6 +31,9 @@
 
 ### Performance
 
+- Optional speculative decoding: `LLAMACPP_DRAFT_MODEL` (draft GGUF path) now maps to the
+  llama-server `--draft-model` flag when the installed build advertises it, enabling the
+  draft-then-verify loop that is the largest CPU-only throughput lever for local serving.
 - Exact tokenizer-based context admission only runs near the context limit (>= 80% of prompt plus
   output budget); shorter prompts skip the extra engine round-trip before generation.
 - Streaming requests always ask llama.cpp for a terminal usage chunk so completion tokens are

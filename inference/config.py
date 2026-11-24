@@ -193,6 +193,12 @@ class Settings:
     llamacpp_reasoning_format: str = field(
         default_factory=lambda: os.getenv("LLAMACPP_REASONING_FORMAT", "").strip().lower()
     )
+    # Optional speculative-decoding draft model GGUF path. When set and the
+    # installed llama-server supports --draft-model, the engine runs a
+    # draft-then-verify loop, the largest CPU-only throughput lever available.
+    llamacpp_draft_model: str = field(
+        default_factory=lambda: os.getenv("LLAMACPP_DRAFT_MODEL", "").strip()
+    )
     # Minimum chunk size (tokens) for prefix reuse between related prompts;
     # 0 disables the extra reuse pass.
     llamacpp_cache_reuse: int = field(

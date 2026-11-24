@@ -583,6 +583,70 @@ def test_runtime_command_skips_unsupported_optional_flags(monkeypatch, tmp_path)
     assert "--cache-ram" not in command
 
 
+def test_managed_command_passes_speculative_decoding_flag(monkeypatch, tmp_path) -> None:
+    """LLAMACPP_DRAFT_MODEL maps to llama-server --draft-model when supported."""
+    runtime = LlamaCppRuntime()
+    monkeypatch.setattr(settings, "llamacpp_model", str(tmp_path / "model.gguf"))
+    monkeypatch.setattr(settings, "llamacpp_draft_model", "/models/draft-Qwen3-1.5B.gguf")
+    runtime.supported_flags = {
+        "--model",
+        "--host",
+        "--port",
+        "--ctx-size",
+        "--threads",
+        "--batch-size",
+        "--ubatch-size",
+        "--draft-model",
+    }
+
+    command = runtime.command()
+
+    assert "--draft-model" in command
+    assert command[command.index("--draft-model") + 1] == "/models/draft-Qwen3-1.5B.gguf"
+
+
+def test_managed_command_skips_draft_flag_when_unsupported(monkeypatch, tmp_path) -> None:
+    runtime = LlamaCppRuntime()
+    monkeypatch.setattr(settings, "llamacpp_model", str(tmp_path / "model.gguf"))
+    monkeypatch.setattr(settings, "llamacpp_draft_model", "/models/draft-Qwen3-1.5B.gguf")
+    runtime.supported_flags = {
+        "--model",
+        "--host",
+        "--port",
+        "--ctx-size",
+        "--threads",
+        "--batch-size",
+        "--ubatch-size",
+    }
+
+    command = runtime.command()
+
+    assert "--draft-model" not in command
+
+
+def test_managed_command_omits_draft_flag_when_unset(monkeypatch, tmp_path) -> None:
+    runtime = LlamaCppRuntime()
+    monkeypatch.setattr(settings, "llamacpp_model", str(tmp_path / "model.gguf"))
+    monkeypatch.setattr(settings, "llamacpp_draft_model", "")
+
+    command = runtime.command()
+
+    assert "--draft-model" not in command
+
+
+def test_llamacpp_capabilities_expose_draft_model(monkeypatch) -> None:
+    runtime = LlamaCppRuntime()
+    monkeypatch.setattr(settings, "llamacpp_managed", True)
+    monkeypatch.setattr(settings, "llamacpp_metrics", True)
+    monkeypatch.setattr(settings, "llamacpp_url", "http://127.0.0.1:8081")
+
+    runtime.supported_flags = {"--model", "--host", "--port", "--ctx-size", "--threads"}
+
+    capabilities = runtime.capabilities()
+    assert capabilities["draft_model"] is False
+    assert capabilities["engine_metrics_url"].endswith("/metrics")
+
+
 @pytest.mark.asyncio
 async def test_log_capture_rotates_while_runtime_is_running(monkeypatch, tmp_path) -> None:
     runtime = LlamaCppRuntime()

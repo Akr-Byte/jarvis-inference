@@ -29,6 +29,7 @@ OPTIONAL_FLAGS = {
     "--cache-reuse": "cache_reuse",
     "--cache-type-k": "kv_cache_type_k",
     "--cache-type-v": "kv_cache_type_v",
+    "--draft-model": "draft_model",
     "--flash-attn": "flash_attention",
     "--jinja": "jinja",
     "--metrics": "metrics",
@@ -296,6 +297,9 @@ class LlamaCppRuntime:
             if value is None or not self._flag_supported(flag, capability):
                 continue
             cmd.extend((flag, value))
+        if settings.llamacpp_draft_model:
+            if self._flag_supported("--draft-model", "draft_model"):
+                cmd.extend(("--draft-model", settings.llamacpp_draft_model))
         return cmd
 
     def _flag_supported(self, flag: str, capability: str) -> bool:
@@ -691,6 +695,7 @@ class LlamaCppRuntime:
             "gpu_layers": None if supported is None else "--n-gpu-layers" in supported,
             "cache_reuse": None if supported is None else "--cache-reuse" in supported,
             "reasoning_format": None if supported is None else "--reasoning-format" in supported,
+            "draft_model": None if supported is None else "--draft-model" in supported,
             "embeddings": (
                 settings.llamacpp_embeddings and (supported is None or "--embedding" in supported)
             ),
@@ -781,6 +786,14 @@ def validate_runtime_tuning() -> None:
             "LLAMACPP_JINJA=false disables the model chat template: tool calls, reasoning "
             "extraction and role handling degrade compared with other OpenAI engines"
         )
+    if settings.llamacpp_draft_model:
+        supported = runtime.supported_flags
+        if supported is not None and "--draft-model" not in supported:
+            logger.warning(
+                "LLAMACPP_DRAFT_MODEL=%r is set but this llama-server build lacks --draft-model; "
+                "speculative decoding stays disabled",
+                settings.llamacpp_draft_model,
+            )
 
 
 def require_memory_capacity(estimate: MemoryEstimate, *, estimate_bytes: int | None = None) -> None:

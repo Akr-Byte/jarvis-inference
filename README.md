@@ -181,6 +181,7 @@ surface). Highlights:
 | `LLAMACPP_BATCH_SIZE` / `LLAMACPP_UBATCH_SIZE` | `512` / `128` | llama.cpp logical batch and micro-batch; larger values trade memory for prefill throughput. |
 | `LLAMACPP_PARALLEL` | `1` | llama-server slots; keep `MAX_CONCURRENT_REQUESTS <= LLAMACPP_PARALLEL`. |
 | `LLAMACPP_GPU_LAYERS` | `0` | Layers offloaded to a GPU build; `99` offloads everything on a discrete GPU. |
+| `LLAMACPP_DRAFT_MODEL` | *(empty)* | Optional speculative-decoding draft GGUF path; enables `--draft-model` when the build supports it. |
 | `LLAMACPP_JINJA` | `true` | Use the model's own chat template (tool calls, roles, reasoning extraction). |
 | `LLAMACPP_METRICS` | `true` | Expose llama-server's Prometheus endpoint (slot/cache/token telemetry). |
 | `LLAMACPP_MLOCK` | `false` | Lock model weights in RAM on CPU workstations; avoid on memory-constrained hosts. |
@@ -291,6 +292,21 @@ Engine tuning compared with direct `llama-server` use:
   clean `429`.
 - Managed mode binds `llama-server` to loopback by default. The engine has no authentication of its
   own, so binding it to a public interface bypasses gateway auth, admission and queueing.
+
+CPU-only performance tuning (recommended for the native workstation profile):
+
+- Set `LLAMACPP_DRAFT_MODEL` to a small distilled GGUF (for example a 1.5B or 3B draft of the target
+  model) to enable speculative decoding. It maps to llama-server's `--draft-model` when the build
+  supports it; startup skips the flag with a warning when it does not. Draft-then-verify sampling is
+  the largest single lever for CPU-only token generation (often 2-3x on supported models).
+- Keep `LLAMACPP_CACHE_TYPE_K` / `LLAMACPP_CACHE_TYPE_V` at a quantized type such as `q8_0` with
+  `LLAMACPP_FLASH_ATTENTION=true`; quantized KV halves cache memory bandwidth, which speeds both
+  prefill reuse and decode.
+- Keep `LLAMACPP_CACHE_PROMPT=true` and raise `LLAMACPP_CACHE_REUSE` (tokens) for agent workloads
+  that share prefixes across turns.
+- Keep the physical-core thread defaults (no SMT oversubscription) and raise
+  `LLAMACPP_BATCH_SIZE` / `LLAMACPP_UBATCH_SIZE` only after measuring memory headroom; larger logical
+  batches improve prefill SIMD utilization at the cost of batch buffers.
 
 The constrained Ollama example is [.env.constrained-homelab.example](.env.constrained-homelab.example).
 It keeps 8K context, one active generation and the existing Ollama backend. The installer creates
