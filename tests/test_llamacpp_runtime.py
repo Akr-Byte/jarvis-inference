@@ -35,8 +35,8 @@ def test_managed_command_carries_workstation_tuning(monkeypatch, tmp_path) -> No
     assert command[command.index("--cache-type-k") + 1] == "q8_0"
 
 
-def test_managed_command_emits_cache_ram_limit_in_bytes(monkeypatch, tmp_path) -> None:
-    """--cache-ram takes bytes; the MB-named setting must be converted before emission."""
+def test_managed_command_emits_cache_ram_limit_in_mib(monkeypatch, tmp_path) -> None:
+    """--cache-ram takes MiB in current llama.cpp; the setting name is authoritative."""
     runtime = LlamaCppRuntime()
     monkeypatch.setattr(settings, "llamacpp_model", str(tmp_path / "model.gguf"))
     monkeypatch.setattr(settings, "llamacpp_cache_ram_mib", 4096)
@@ -54,7 +54,13 @@ def test_managed_command_emits_cache_ram_limit_in_bytes(monkeypatch, tmp_path) -
     command = runtime.command()
 
     assert "--cache-ram" in command
-    assert command[command.index("--cache-ram") + 1] == str(4096 * 1024**2)
+    assert command[command.index("--cache-ram") + 1] == "4096"
+
+    # Zero is emitted too, so the engine disables the cache instead of using
+    # its large built-in default.
+    monkeypatch.setattr(settings, "llamacpp_cache_ram_mib", 0)
+    command = runtime.command()
+    assert command[command.index("--cache-ram") + 1] == "0"
 
 
 def test_managed_command_passes_engine_parity_flags(monkeypatch, tmp_path) -> None:

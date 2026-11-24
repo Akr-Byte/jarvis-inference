@@ -1,5 +1,6 @@
 import asyncio
 import time
+from typing import Any
 
 import pytest
 
@@ -7,7 +8,13 @@ from inference.config import settings
 from inference.errors import InferenceError
 from inference.metrics import ACTIVE_MODEL
 from inference.models import model_manager
-from inference.scheduler import Scheduler, _check_context_window, estimate_prompt_tokens
+from inference.scheduler import (
+    Scheduler,
+    StreamLease,
+    _admit_context_window,
+    _check_context_window,
+    estimate_prompt_tokens,
+)
 
 
 class FakeBackend:
@@ -740,3 +747,52 @@ async def test_oversized_chat_forwards_compacted_payload(scheduler: Scheduler, m
 
     assert backend.payload is not None
     assert [message["content"] for message in backend.payload["messages"]] == ["SYS", "NEW"]
+
+
+@pytest.mark.asyncio
+async def test_compacted_payload_is_reverified_by_tokenizer(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "max_context_length", 512)
+    monkeypatch.setattr(settings, "max_output_tokens", 16)
+
+    class TokenizerBackend:
+        name = "llama.cpp"
+
+        def __init__(self) -> None:
+            self.counts: list[dict[str, Any]] = []
+
+        async def count_chat_tokens(self, model: str, payload: dict) -> int:
+            self.counts.append(dict(payload))
+            return 900 if len(payload["messages"]) == 3 else 100
+
+    backend = TokenizerBackend()
+    payload = {
+        "model": "qwen3:1.7b",
+        "messages": [
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "x" * 3000},
+            {"role": "user", "content": "NEW"},
+        ],
+    }
+
+    admitted = await _admit_context_window(payload, backend)
+
+    assert [message["content"] for message in admitted["messages"]] == ["SYS", "NEW"]
+    assert len(backend.counts) == 2
+
+
+@pytest.mark.asyncio
+async def test_stale_sweep_cancels_abandoned_stream_task(scheduler: Scheduler) -> None:
+    async def sleeper() -> None:
+        await asyncio.sleep(60)
+
+    task = asyncio.create_task(sleeper())
+    lease = StreamLease(model="qwen3:1.7b", request_id="inf-1", task=task)
+    scheduler._leases["inf-1"] = lease
+    stale_age = 1.5 * max(settings.chat_timeout_seconds, settings.stream_timeout_seconds) + 10
+    await scheduler._semaphore.acquire()
+    scheduler._active["inf-1"] = _active_entry("inf-1", stale_age)
+
+    assert scheduler.sweep_stale() == ["inf-1"]
+    assert lease.released
+    await asyncio.gather(task, return_exceptions=True)
+    assert task.cancelled()

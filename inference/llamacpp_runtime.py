@@ -275,9 +275,9 @@ class LlamaCppRuntime:
             ("--alias", self.active_model_id or settings.llamacpp_alias or None, "alias"),
             (
                 "--cache-ram",
-                str(settings.llamacpp_cache_ram_mib * 1024**2)
-                if settings.llamacpp_cache_ram_mib
-                else None,
+                # llama.cpp documents this flag in MiB. Pass 0 explicitly so
+                # the engine does not fall back to its 8192 MiB default.
+                str(settings.llamacpp_cache_ram_mib),
                 "cache_ram_limit",
             ),
             (
@@ -809,16 +809,26 @@ def validate_runtime_tuning() -> None:
             settings.max_concurrent_requests,
             settings.llamacpp_parallel,
         )
-    try:
-        logical = len(os.sched_getaffinity(0))
-    except AttributeError:  # pragma: no cover - non-Linux
-        logical = psutil.cpu_count(logical=True) or 1
-    if settings.llamacpp_threads > logical:
+    if settings.llamacpp_managed:
+        # In external mode the gateway's affinity says nothing about the
+        # engine container's quota; only warn for the owned child whose CPU
+        # allocation matches this process.
+        try:
+            logical = len(os.sched_getaffinity(0))
+        except AttributeError:  # pragma: no cover - non-Linux
+            logical = psutil.cpu_count(logical=True) or 1
+        if settings.llamacpp_threads > logical:
+            logger.warning(
+                "LLAMACPP_THREADS (%s) exceeds the %s CPUs available to this process; threading "
+                "above the physical core count usually reduces tokens/s",
+                settings.llamacpp_threads,
+                logical,
+            )
+    if settings.llamacpp_embeddings and not settings.llamacpp_managed:
         logger.warning(
-            "LLAMACPP_THREADS (%s) exceeds the %s CPUs available to this process; threading above "
-            "the physical core count usually reduces tokens/s",
-            settings.llamacpp_threads,
-            logical,
+            "LLAMACPP_EMBEDDINGS=true but the external llama-server was not started by the gateway; "
+            "pass --embedding via LLAMA_EXTRA_ARGS or use managed mode, otherwise embedding "
+            "requests will fail at the engine"
         )
     if settings.llamacpp_parallel > 1 and settings.max_concurrent_requests <= 1:
         logger.warning(

@@ -83,6 +83,10 @@
   decode tokens/s in addition to total latency.
 - SSE lines are decoded once by the scheduler and the parsed event is attached to the streamed line,
   so the API layer no longer re-parses every token to decide whether to suppress a usage chunk.
+- The containerized engine now receives explicit `--threads` / `--threads-batch` values matching its
+  Compose CPU quota, instead of inheriting host-core defaults that oversubscribe the container.
+- Model-discovery results are cached for two seconds, removing repeated `rglob` and `stat` work from
+  status and metadata endpoints while still noticing model changes.
 
 ### Fixed
 
@@ -106,6 +110,19 @@
   target-only engine never receives draft parameters.
 - The installer waits up to six minutes for `llama-server` health, matching the extended Compose
   startup window for large GGUF loads.
+- Managed `--cache-ram` now receives MiB rather than bytes, matching the pinned llama.cpp build, and
+  zero is forwarded explicitly so the engine's 8192 MiB default cannot silently apply.
+- A compacted prompt that was rejected by the exact tokenizer is re-counted with the same tokenizer
+  before being accepted; a heuristic can no longer re-admit a prompt the engine rejected.
+- Stale-stream cleanup cancels the task driving the abandoned backend stream and marks the lease
+  released, preventing a late cleanup from decrementing another live request's model gauge.
+- Engine capability probing matches whole option tokens, so a longer or deprecated flag in the help
+  text can no longer be mistaken for support.
+- The benchmark's decode-rate metric excludes the first token, whose generation time is already
+  counted in time to first token.
+- Enabling `LLAMACPP_EMBEDDINGS` with an external engine now logs a warning that `--embedding` must
+  be supplied through `LLAMA_EXTRA_ARGS`; the thread-oversubscription warning is limited to managed
+  mode, where gateway affinity actually describes the engine process.
 
 ## 0.5.1
 

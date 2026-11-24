@@ -56,6 +56,12 @@ class StreamLease:
     request_id: str
     released: bool = False
     payload: dict[str, Any] | None = None
+    task: asyncio.Task[Any] | None = None
+
+    def cancel(self) -> None:
+        """Cancel the task driving this stream, if it is still running."""
+        if self.task is not None and not self.task.done():
+            self.task.cancel()
 
 
 # Keys that do not belong to the rendered prompt. Kept in one place so the
@@ -114,19 +120,50 @@ def _prompt_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if key not in _NON_PROMPT_KEYS}
 
 
+def _compact_payload(
+    payload: dict[str, Any], effective: int, output_budget: int
+) -> dict[str, Any] | None:
+    """Return a suffix-only candidate that fits the heuristic budget, if one exists."""
+    messages = payload.get("messages", [])
+    if len(messages) <= 1:
+        return None
+    system = [msg for msg in messages if msg.get("role") == "system"]
+    conversation = [msg for msg in messages if msg.get("role") != "system"]
+    running = sum(estimate_prompt_tokens([msg]) for msg in system)
+    newest_first: list[dict[str, Any]] = []
+    for msg in reversed(conversation):
+        msg_tokens = estimate_prompt_tokens([msg])
+        if running + msg_tokens + output_budget > effective:
+            break
+        newest_first.append(msg)
+        running += msg_tokens
+    compacted_messages = system + list(reversed(newest_first))
+    if len(compacted_messages) >= len(messages):
+        return None
+    compacted = dict(payload)
+    compacted["messages"] = compacted_messages
+    compacted_tokens = estimate_prompt_tokens(
+        _prompt_payload(compacted) or compacted_messages
+    )
+    if compacted_tokens + output_budget > effective:
+        return None
+    return compacted
+
+
 def _check_context_window(
     payload: dict[str, Any],
     actual_prompt_tokens: int | None = None,
     *,
     estimated_prompt_tokens: int | None = None,
+    allow_compaction: bool = True,
 ) -> dict[str, Any]:
     """Return a payload that fits the effective context window (GW-6).
 
     Oversized multi-message chats are compacted by dropping the oldest
     non-system messages; the returned payload is the one callers must forward
     to the backend. A single oversized message cannot be compacted and is
-    rejected. llama.cpp's tokenizer route counts the rendered chat prompt when
-    present; otherwise a UTF-8 JSON byte-length heuristic is used.
+    rejected. Set ``allow_compaction=False`` when an exact tokenizer already
+    rejected the original prompt so a heuristic cannot re-admit it.
     """
     effective, output_budget = _context_limits(payload)
     estimated = (
@@ -140,31 +177,16 @@ def _check_context_window(
     if prompt_tokens + output_budget <= effective:
         return payload
 
-    messages = payload.get("messages", [])
-    if len(messages) > 1:
-        system = [msg for msg in messages if msg.get("role") == "system"]
-        conversation = [msg for msg in messages if msg.get("role") != "system"]
-        system_tokens = sum(estimate_prompt_tokens([msg]) for msg in system)
-        newest_first: list[dict[str, Any]] = []
-        running = system_tokens
-        for msg in reversed(conversation):
-            msg_tokens = estimate_prompt_tokens([msg])
-            if running + msg_tokens + output_budget > effective:
-                break
-            newest_first.append(msg)
-            running += msg_tokens
-        compacted_messages = system + list(reversed(newest_first))
-        if len(compacted_messages) < len(messages):
-            compacted = dict(payload)
-            compacted["messages"] = compacted_messages
+    if allow_compaction:
+        compacted = _compact_payload(payload, effective, output_budget)
+        if compacted is not None:
             compacted_tokens = estimate_prompt_tokens(
-                _prompt_payload(compacted) or compacted_messages
+                _prompt_payload(compacted) or compacted.get("messages", [])
             )
             CONTEXT_USAGE.labels(model=model_label).observe(
                 (compacted_tokens + output_budget) / effective
             )
-            if compacted_tokens + output_budget <= effective:
-                return compacted
+            return compacted
 
     count_label = (
         "tokenizer-counted prompt" if actual_prompt_tokens is not None else "estimated prompt"
@@ -213,8 +235,22 @@ async def _admit_context_window(payload: dict[str, Any], backend: Any) -> dict[s
         return _check_context_window(payload, estimated_prompt_tokens=estimated)
     tokenizer = getattr(backend, "count_chat_tokens", None)
     actual = await tokenizer(model, payload) if tokenizer else None
+    if tokenizer and actual is not None and actual + output_budget > effective:
+        candidate = _compact_payload(payload, effective, output_budget)
+        if candidate is not None:
+            verified = await tokenizer(model, candidate)
+            if verified is not None and verified + output_budget <= effective:
+                CONTEXT_USAGE.labels(model=model).observe(
+                    (verified + output_budget) / effective
+                )
+                return candidate
+    # A heuristic must not re-admit a prompt the engine's tokenizer rejected;
+    # when no exact count is available, the heuristic is still the best signal.
     return _check_context_window(
-        payload, actual_prompt_tokens=actual, estimated_prompt_tokens=estimated
+        payload,
+        actual_prompt_tokens=actual,
+        estimated_prompt_tokens=estimated,
+        allow_compaction=actual is None,
     )
 
 
@@ -225,6 +261,7 @@ class Scheduler:
         self._ollama = OllamaBackend()
         self._llama = LlamaCppBackend()
         self._active: dict[str, dict[str, Any]] = {}
+        self._leases: dict[str, StreamLease] = {}
         self._model_active: dict[str, int] = {}
         self._request_counter = 0
         self._sweeper_task: asyncio.Task[None] | None = None
@@ -378,6 +415,14 @@ class Scheduler:
             ACTIVE_REQUESTS.dec()
             STALE_REQUESTS.inc()
             swept.append(request_id)
+            lease = self._leases.pop(request_id, None)
+            if lease is not None:
+                # The sweep already released the slot and model gauge. Marking
+                # the lease released prevents a late cleanup from decrementing
+                # another live request's gauge; cancelling the driving task
+                # also stops the abandoned backend generation.
+                lease.released = True
+                lease.cancel()
             if not any(other["model"] == model for other in self._active.values()):
                 self._model_active.pop(model, None)
                 ACTIVE_MODEL.labels(model=model).set(0)
@@ -665,6 +710,7 @@ class Scheduler:
             model_manager.activate(model, warm)
             self._activate_model(model)
             lease = StreamLease(model=model, request_id=request_id, payload=payload)
+            self._leases[request_id] = lease
             lease_created = True
             return lease
         except asyncio.CancelledError:
@@ -684,6 +730,7 @@ class Scheduler:
         if lease.released:
             return
         lease.released = True
+        self._leases.pop(lease.request_id, None)
         self._deactivate_model(lease.model)
         self._release_slot(lease.request_id, lease.model)
 
@@ -706,6 +753,9 @@ class Scheduler:
         payload.setdefault("max_tokens", settings.max_output_tokens)
         started: float | None = None
         first_token: float | None = None
+        # The stale sweeper cancels this task if the client abandons the
+        # stream and normal cleanup never runs.
+        lease.task = asyncio.current_task()
         try:
             started = time.perf_counter()
             saw_done = False

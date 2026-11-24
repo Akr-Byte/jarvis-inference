@@ -63,7 +63,10 @@ for _ in range(count):
     totals.append(total)
     ttfts.append(ttft if ttft is not None else total)
     decode_seconds = max(0.001, total - ttfts[-1])
-    rates.append(completion_tokens / decode_seconds if completion_tokens else 0.0)
+    # TTFT already includes generation of the first token, so exclude it from
+    # the numerator when measuring post-first-token decode throughput.
+    decoded_after_first = max(0, completion_tokens - 1)
+    rates.append(decoded_after_first / decode_seconds if decoded_after_first else 0.0)
 
 
 def summary(values):

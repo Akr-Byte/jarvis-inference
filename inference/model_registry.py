@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -12,6 +13,15 @@ from inference.models import model_manager
 
 SPLIT_SUFFIX = re.compile(r"^(?P<base>.+)-(?P<index>\d{5})-of-(?P<count>\d{5})$")
 QUANT = re.compile(r"(?i)(IQ[1-6]_[A-Z0-9]+|Q[2-8]_[A-Z0-9]+|F16|F32|BF16)")
+
+# A short TTL avoids repeating a full rglob+stat on every status/metadata
+# request while still noticing models added or removed during operation.
+DISCOVERY_TTL_SECONDS = 2.0
+_discovery_cache: dict[Path, tuple[float, list["DiscoveredModel"]]] = {}
+
+
+def invalidate_discovery_cache() -> None:
+    _discovery_cache.clear()
 
 
 @dataclass(frozen=True)
@@ -25,7 +35,12 @@ class DiscoveredModel:
 
 def discover_gguf(directory: Path | None = None) -> list[DiscoveredModel]:
     root = (directory or settings.model_directory).expanduser()
+    cached = _discovery_cache.get(root)
+    now = time.monotonic()
+    if cached is not None and now - cached[0] < DISCOVERY_TTL_SECONDS:
+        return cached[1]
     if not root.is_dir():
+        _discovery_cache[root] = (now, [])
         return []
     files = sorted(path for path in root.rglob("*.gguf") if path.is_file())
     grouped: dict[str, list[tuple[Path, int, int]]] = {}
@@ -48,7 +63,9 @@ def discover_gguf(directory: Path | None = None) -> list[DiscoveredModel]:
             continue
         paths = tuple(item[0] for item in shards)
         entries.append(_entry(paths[0], paths, model_id=base))
-    return sorted(entries, key=lambda model: model.id.casefold())
+    discovered = sorted(entries, key=lambda model: model.id.casefold())
+    _discovery_cache[root] = (now, discovered)
+    return discovered
 
 
 def _entry(first: Path, shards: tuple[Path, ...], model_id: str | None = None) -> DiscoveredModel:

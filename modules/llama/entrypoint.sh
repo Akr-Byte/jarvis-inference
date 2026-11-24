@@ -42,7 +42,9 @@ HELP_TEXT=$(llama-server --help 2>&1 || true)
 ARGS=""
 
 has_flag() {
-    printf '%s\n' "$HELP_TEXT" | grep -q -- "$1"
+    # Match the flag as a whole option token, not as a substring of a longer
+    # option or a deprecation note in the help text.
+    printf '%s\n' "$HELP_TEXT" | grep -Eq -- "(^|[[:space:],])$1([[:space:],=]|$)"
 }
 skip_flag() {
     echo "warning: llama-server does not support $1; skipping" >&2
@@ -132,8 +134,9 @@ if is_true "${LLAMACPP_CACHE_PROMPT:-true}"; then
 fi
 cache_ram="${LLAMACPP_CACHE_RAM_MIB:-0}"
 case "$cache_ram" in '' | *[!0-9]*) cache_ram=0 ;; esac
-# llama-server's --cache-ram unit is MiB (the managed runtime converts bytes).
-[ "$cache_ram" -gt 0 ] && add_valued --cache-ram "$cache_ram"
+# llama-server's --cache-ram unit is MiB; 0 explicitly disables the cache
+# instead of leaving the engine's 8192 MiB default in place.
+add_valued --cache-ram "$cache_ram"
 cache_reuse="${LLAMACPP_CACHE_REUSE:-0}"
 case "$cache_reuse" in '' | *[!0-9]*) cache_reuse=0 ;; esac
 [ "$cache_reuse" -gt 0 ] && add_valued --cache-reuse "$cache_reuse"
