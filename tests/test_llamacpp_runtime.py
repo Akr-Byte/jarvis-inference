@@ -78,7 +78,7 @@ def test_managed_command_passes_engine_parity_flags(monkeypatch, tmp_path) -> No
         "--ubatch-size",
         "--jinja",
         "--metrics",
-        "--mlock",
+        "--load-mode",
         "--reasoning-format",
         "--cache-reuse",
         "--n-gpu-layers",
@@ -88,7 +88,8 @@ def test_managed_command_passes_engine_parity_flags(monkeypatch, tmp_path) -> No
 
     assert "--jinja" in command
     assert "--metrics" in command
-    assert "--mlock" in command
+    assert "--load-mode" in command
+    assert command[command.index("--load-mode") + 1] == "mlock"
     assert command[command.index("--reasoning-format") + 1] == "auto"
     assert command[command.index("--cache-reuse") + 1] == "256"
     assert command[command.index("--n-gpu-layers") + 1] == "99"

@@ -35,11 +35,15 @@ OPTIONAL_FLAGS = {
     "--draft-ctx-size": "draft_ctx_size",
     "--flash-attn": "flash_attention",
     "--jinja": "jinja",
+    "--load-mode": "load_mode",
     "--metrics": "metrics",
     "--mlock": "mlock",
     "--n-gpu-layers": "gpu_layers",
     "--parallel": "parallel_slots",
     "--reasoning-format": "reasoning_format",
+    "--spec-draft-model": "spec_draft_model",
+    "--spec-draft-n-max": "spec_draft_n_max",
+    "--spec-draft-n-min": "spec_draft_n_min",
     "--threads-batch": "batch_threads",
     "--embedding": "embeddings",
 }
@@ -258,7 +262,6 @@ class LlamaCppRuntime:
             ("--cache-prompt", settings.llamacpp_cache_prompt, "prompt_cache"),
             ("--jinja", settings.llamacpp_jinja, "jinja"),
             ("--metrics", settings.llamacpp_metrics, "metrics"),
-            ("--mlock", settings.llamacpp_mlock, "mlock"),
             ("--embedding", settings.llamacpp_embeddings, "embeddings"),
         ]
         reasoning_format = settings.llamacpp_reasoning_format
@@ -297,6 +300,7 @@ class LlamaCppRuntime:
             ("--parallel", str(settings.llamacpp_parallel), "parallel_slots"),
             ("--reasoning-format", reasoning_format or None, "reasoning_format"),
             ("--threads-batch", str(settings.llamacpp_batch_threads), "batch_threads"),
+            ("--load-mode", "mlock" if settings.llamacpp_mlock else None, "load_mode"),
         ]
         for flag, enabled, capability in switches:
             if not enabled or not self._flag_supported(flag, capability):
@@ -307,17 +311,32 @@ class LlamaCppRuntime:
                 continue
             cmd.extend((flag, value))
         if settings.llamacpp_draft_model:
-            if self._flag_supported("--draft-model", "draft_model"):
-                cmd.extend(("--draft-model", settings.llamacpp_draft_model))
-            if self._flag_supported("--draft-max-len", "draft_max_len"):
-                cmd.extend(("--draft-max-len", str(settings.llamacpp_draft_max_len)))
-            if self._flag_supported("--draft-min-len", "draft_min_len"):
-                cmd.extend(
-                    (
-                        "--draft-min-len",
-                        str(min(settings.llamacpp_draft_min_len, settings.llamacpp_draft_max_len)),
-                    )
-                )
+            # llama.cpp renamed the speculative-decoding flags across releases;
+            # prefer the current `--spec-draft-*` names and fall back to the
+            # legacy aliases when the installed build only knows those.
+            for flag, capability, value in (
+                ("--spec-draft-model", "spec_draft_model", settings.llamacpp_draft_model),
+                ("--draft-model", "draft_model", settings.llamacpp_draft_model),
+            ):
+                if self._flag_supported(flag, capability):
+                    cmd.extend((flag, value))
+                    break
+            draft_max = str(settings.llamacpp_draft_max_len)
+            draft_min = str(min(settings.llamacpp_draft_min_len, settings.llamacpp_draft_max_len))
+            for flag, capability, value in (
+                ("--spec-draft-n-max", "spec_draft_n_max", draft_max),
+                ("--draft-max-len", "draft_max_len", draft_max),
+            ):
+                if self._flag_supported(flag, capability):
+                    cmd.extend((flag, value))
+                    break
+            for flag, capability, value in (
+                ("--spec-draft-n-min", "spec_draft_n_min", draft_min),
+                ("--draft-min-len", "draft_min_len", draft_min),
+            ):
+                if self._flag_supported(flag, capability):
+                    cmd.extend((flag, value))
+                    break
             if settings.llamacpp_draft_ctx_size and self._flag_supported(
                 "--draft-ctx-size", "draft_ctx_size"
             ):
@@ -730,6 +749,9 @@ class LlamaCppRuntime:
             "draft_max_len": None if supported is None else "--draft-max-len" in supported,
             "draft_min_len": None if supported is None else "--draft-min-len" in supported,
             "draft_ctx_size": None if supported is None else "--draft-ctx-size" in supported,
+            "spec_draft_model": None if supported is None else "--spec-draft-model" in supported,
+            "spec_draft_n_max": None if supported is None else "--spec-draft-n-max" in supported,
+            "spec_draft_n_min": None if supported is None else "--spec-draft-n-min" in supported,
             "embeddings": (
                 settings.llamacpp_embeddings and (supported is None or "--embedding" in supported)
             ),
@@ -742,6 +764,7 @@ class LlamaCppRuntime:
                 if settings.llamacpp_metrics and settings.llamacpp_base_url
                 else None
             ),
+            "load_mode": None if supported is None else "--load-mode" in supported,
             "configured_cache": {
                 "prompt_cache": settings.llamacpp_cache_prompt,
                 "cache_ram_mib": settings.llamacpp_cache_ram_mib,
@@ -820,12 +843,21 @@ def validate_runtime_tuning() -> None:
             "LLAMACPP_JINJA=false disables the model chat template: tool calls, reasoning "
             "extraction and role handling degrade compared with other OpenAI engines"
         )
+    if settings.llamacpp_mlock and (
+        runtime.supported_flags is None or "--load-mode" not in runtime.supported_flags
+    ):
+        logger.warning(
+            "LLAMACPP_MLOCK=true but this llama-server build lacks --load-mode; memory locking stays off"
+        )
     if settings.llamacpp_draft_model:
         supported = runtime.supported_flags
-        if supported is not None and "--draft-model" not in supported:
+        draft_supported = (
+            supported is None or "--spec-draft-model" in supported or "--draft-model" in supported
+        )
+        if not draft_supported:
             logger.warning(
-                "LLAMACPP_DRAFT_MODEL=%r is set but this llama-server build lacks --draft-model; "
-                "speculative decoding stays disabled",
+                "LLAMACPP_DRAFT_MODEL=%r is set but this llama-server build lacks speculative "
+                "decoding flags (--spec-draft-model/--draft-model); speculative decoding stays disabled",
                 settings.llamacpp_draft_model,
             )
 
