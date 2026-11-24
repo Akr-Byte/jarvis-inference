@@ -5,6 +5,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONOPTIMIZE=2
 
+# libgomp1 is required by the managed llama-server binary (OpenMP runtime);
+# without it the engine fails at exec with exit 127 during capability probing.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY inference ./inference

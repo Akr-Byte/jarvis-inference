@@ -131,6 +131,10 @@ class Settings:
     ollama_url: str = field(
         default_factory=lambda: os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
     )
+    # Explicit inference backend selector ("ollama" or "llamacpp"). Empty
+    # keeps the legacy derivation: LLAMACPP_URL / LLAMACPP_MANAGED selects
+    # llama.cpp, anything else falls back to Ollama.
+    backend: str = field(default_factory=lambda: os.getenv("INFERENCE_BACKEND", "").strip().lower())
     llamacpp_url: str = field(default_factory=lambda: os.getenv("LLAMACPP_URL", "").rstrip("/"))
     llamacpp_managed: bool = field(
         default_factory=lambda: (
@@ -266,7 +270,7 @@ class Settings:
         )
     )
     max_context_length: int = field(
-        default_factory=lambda: max(512, _int("MAX_CONTEXT_LENGTH", 16384))
+        default_factory=lambda: max(512, _int("MAX_CONTEXT_LENGTH", 131072))
     )
     max_output_tokens: int = field(default_factory=lambda: max(1, _int("MAX_OUTPUT_TOKENS", 2048)))
     max_embedding_batch_size: int = field(
@@ -285,6 +289,15 @@ class Settings:
         if self.llamacpp_managed:
             return f"http://{self.llamacpp_host}:{self.llamacpp_port}"
         return ""
+
+    @property
+    def active_backend(self) -> str:
+        """Active inference backend: "ollama" or "llama.cpp"."""
+        if self.backend == "ollama":
+            return "ollama"
+        if self.backend == "llamacpp":
+            return "llama.cpp"
+        return "llama.cpp" if self.llamacpp_base_url else "llama.cpp"
 
     @property
     def llamacpp_model_map(self) -> dict[str, str]:

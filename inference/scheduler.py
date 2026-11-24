@@ -125,6 +125,55 @@ def _check_context_window(
         (prompt_tokens + output_budget) / effective
     )
     if prompt_tokens + output_budget > effective:
+        # Attempt context compaction: trim oldest messages, keeping system prompt + newest
+        messages = payload.get("messages", [])
+        if messages and len(messages) > 1:
+            # Keep system prompt + newest messages only
+            system_msg = None
+            conversation = []
+            for msg in messages:
+                if msg.get("role") == "system":
+                    system_msg = msg
+                else:
+                    conversation.append(msg)
+
+            # Keep system + newest messages, removing oldest first
+            kept = [system_msg] if system_msg else []
+            # Try adding messages from the end (newest) backwards
+            test_kept = kept
+            for older_msg in reversed(conversation):
+                test_kept = test_kept + [older_msg]
+                # Estimate tokens
+                escaped = json.dumps(test_kept, ensure_ascii=True)
+                byte_est = (len(escaped.encode("utf-8")) + 2) // 3
+                groups = 0
+                in_word = False
+                prompt = json.dumps(test_kept, ensure_ascii=False)
+                for char in prompt:
+                    if char.isalnum() or ord(char) > 127:
+                        if not in_word:
+                            groups += 1
+                        in_word = True
+                    elif char.isspace():
+                        in_word = False
+                    else:
+                        groups += 1
+                        in_word = False
+                est = max(byte_est, groups)
+
+                if est <= effective - output_budget:
+                    kept = test_kept
+                else:
+                    break
+
+            # Recursively check with trimmed messages
+            payload_copy = dict(payload)
+            payload_copy["messages"] = kept
+            _check_context_window(
+                payload_copy, actual_prompt_tokens=None, estimated_prompt_tokens=None
+            )
+            return
+
         count_label = (
             "tokenizer-counted prompt" if actual_prompt_tokens is not None else "estimated prompt"
         )
