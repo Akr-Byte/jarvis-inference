@@ -183,7 +183,8 @@ directory read-only at `/models`; the container selects the first GGUF and expos
 | `OLLAMA_URL` | `http://ollama:11434` | Backend base URL. |
 | `LLAMACPP_URL` | *(empty)* | Optional llama.cpp backend URL. |
 | `LLAMACPP_MANAGED` | `false` | Launch and supervise a local llama-server child. |
-| `LLAMACPP_MODEL` / `LLAMACPP_ALIAS` | *(empty)* | GGUF file or first split shard, and public model ID. |
+| `LLAMACPP_MODEL` / `LLAMACPP_ALIAS` | *(empty)* | Native managed mode GGUF file or first split shard, and public model ID. |
+| `LLAMA_MODEL` | *(empty)* | Containerized engine's GGUF path **inside** the container (`/models/...`). Empty auto-selects the first GGUF; pin it to skip incompatible or split models. |
 | `LLAMACPP_MODEL_MAP` | *(empty)* | Optional `id=/path/model.gguf;id2=/path/other.gguf` profiles for managed model switching. |
 | `MODEL_DIRECTORY` | `~/models` | Host directory mounted at `/models` in the engine container; also the recursive scan root for native managed mode. `~` is expanded to the OS home. |
 | `LLAMACPP_THREADS` / `LLAMACPP_BATCH_THREADS` | physical cores | Generation and prompt-processing CPU threads; defaults avoid SMT oversubscription. |

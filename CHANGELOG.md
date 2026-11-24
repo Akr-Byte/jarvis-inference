@@ -61,7 +61,8 @@
   directory (`~/models`) or any absolute host path instead of the repository checkout. The installer
   expands `~` the same way and all model-switching docs use the configured host directory. The
   installer now discovers GGUFs one directory deep, matching the engine entrypoint's split-shard
-  folders.
+  folders. `.env.example` and the configuration table now document `LLAMA_MODEL` separately from the
+  native-mode `LLAMACPP_MODEL`, since the containerized engine needs an in-container path.
 
 ### Performance
 
