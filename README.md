@@ -195,7 +195,7 @@ surface). Highlights:
 | `LLAMACPP_EMBEDDINGS` | `false` | Enable llama.cpp embedding mode only when the configured model/profile supports it. Ollama embeddings stay enabled by default. |
 | `LLAMACPP_RESTART_ENABLED` / `LLAMACPP_MAX_RESTARTS` | `true` / `5` | Bounded recovery after unexpected child exits. |
 | `OLLAMA_KEEP_ALIVE` | `30m` | Backend model residency. |
-| `MAX_CONTEXT_LENGTH` | `8192` | Hard context cap applied before queue admission. |
+| `MAX_CONTEXT_LENGTH` | `16384` | Hard context cap applied before queue admission. |
 | `MAX_OUTPUT_TOKENS` | `2048` | Default and maximum configured output budget; prompt plus output must fit context. |
 | `MAX_EMBEDDING_BATCH_SIZE` | `64` | Inputs per embedding batch. |
 | `INFERENCE_CPUS` / `INFERENCE_MEMORY_LIMIT` | `0.4` / `1g` | Gateway container CPU/memory caps (constrained-host profile). |
@@ -338,7 +338,7 @@ reloads when alternating between `qwen3:1.7b` and `nomic-embed-text`, but benchm
 first; do not increase it blindly because `qwen3:4b` and context memory also compete for the 8-GiB
 Ollama limit.
 
-For CPU-only deployments, `MAX_CONTEXT_LENGTH` defaults to 8192 and request-level `num_ctx` overrides
+For CPU-only deployments, `MAX_CONTEXT_LENGTH` defaults to 16384 and request-level `num_ctx` overrides
 above that cap are rejected before queue admission. `MAX_EMBEDDING_BATCH_SIZE` defaults to 64 inputs per
 request to bound memory and latency; split larger ingestion jobs into smaller batches. Raise either
 limit only after measuring peak RAM and throughput on the target VM.
@@ -348,7 +348,7 @@ Both profiles preserve:
 - One active generation
 - One loaded model
 - Queue size 8 waiting requests (active generation is separate)
-- Context length 8192
+- Context length 16384
 - Ollama keep-alive 30 minutes
 
 Configured models:

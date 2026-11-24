@@ -266,7 +266,7 @@ class Settings:
         )
     )
     max_context_length: int = field(
-        default_factory=lambda: max(512, _int("MAX_CONTEXT_LENGTH", 8192))
+        default_factory=lambda: max(512, _int("MAX_CONTEXT_LENGTH", 16384))
     )
     max_output_tokens: int = field(default_factory=lambda: max(1, _int("MAX_OUTPUT_TOKENS", 2048)))
     max_embedding_batch_size: int = field(
