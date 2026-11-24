@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "jarvis-inference"
 version = "0.6.0"
 description = "Production-grade local inference gateway for the Jarvis stack"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi==0.165.0",

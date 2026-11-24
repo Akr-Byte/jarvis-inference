@@ -43,6 +43,14 @@
   Compose build is self-contained.
 - The installer, environment example, README and runbook now describe the llama.cpp container
   workflow, including how to change the mounted model.
+- Release metadata (version, changelog top entry, README status line and workflow Dockerfile path) is
+  now checked by `scripts/check_release_consistency.py` in both CI and release gates. The stale PyPI
+  badge was removed and links now use the canonical `Akr-Byte` repository.
+- Tag-triggered releases are idempotent and support a manual retry, validate distributions with
+  `twine`, verify the wheel in a clean environment, attach `SHA256SUMS`, publish lowercase GHCR tags
+  including `latest`, and scan the image at `HIGH,CRITICAL` to match the security workflow.
+- `docs/releasing.md` documents the version policy, pre-release checklist, local CI-equivalent gate,
+  publication steps and post-release verification.
 
 ### Performance
 

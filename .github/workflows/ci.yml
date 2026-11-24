@@ -22,6 +22,9 @@ jobs:
       - run: python -m ruff format --check .
       - run: bash -n scripts/*.sh
       - run: sh -n modules/llama/entrypoint.sh
+      - run: python scripts/check_release_consistency.py
+      - name: Build container images
+        run: docker compose build
       - run: python -m pytest -q --cov=inference --cov-report=term-missing --cov-fail-under=70
       - name: Write commit-bound certification manifest
         if: always()

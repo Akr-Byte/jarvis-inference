@@ -2,11 +2,10 @@
 
 **Production-grade local inference gateway for the Jarvis stack.**
 
-[![CI](https://github.com/abdullahalrifat/jarvis-inference/actions/workflows/ci.yml/badge.svg)](https://github.com/abdullahalrifat/jarvis-inference/actions/workflows/ci.yml)
-[![Release](https://github.com/abdullahalrifat/jarvis-inference/releases/badge.svg)](https://github.com/abdullahalrifat/jarvis-inference/releases)
-[![PyPI](https://img.shields.io/pypi/v/jarvis-inference)](https://pypi.org/project/jarvis-inference/)
+[![CI](https://github.com/Akr-Byte/jarvis-inference/actions/workflows/ci.yml/badge.svg)](https://github.com/Akr-Byte/jarvis-inference/actions/workflows/ci.yml)
+[![Release](https://github.com/Akr-Byte/jarvis-inference/releases/badge.svg)](https://github.com/Akr-Byte/jarvis-inference/releases)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
-[![Status](https://img.shields.io/badge/status-beta-blue)](https://github.com/abdullahalrifat/jarvis-inference/releases)
+[![Status](https://img.shields.io/badge/status-beta-blue)](https://github.com/Akr-Byte/jarvis-inference/releases)
 
 The dedicated inference VM owns model execution for the Jarvis stack. This repository is the
 OpenAI-compatible HTTP gateway: an agent-facing API that schedules bounded generations against a
@@ -19,7 +18,7 @@ local model backend (Ollama, or an optional llama.cpp server) and speaks the Ope
 - Jarvis remains usable for local repository work when AI Stack is stopped, and AI Stack remains
   usable when the CLI is not installed.
 
-**Current release: `0.5.1`** — see [CHANGELOG.md](CHANGELOG.md) for release notes.
+**Current release: `0.6.0`** — see [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Table of contents
 
@@ -421,7 +420,7 @@ All commands below are run from the repository root on the dedicated inference V
 Install Docker Engine and Docker Compose v2 first, then:
 
 ```bash
-git clone https://github.com/abdullahalrifat/jarvis-inference.git
+git clone https://github.com/Akr-Byte/jarvis-inference.git
 cd jarvis-inference
 cp .env.example .env
 chmod 600 .env
@@ -764,6 +763,9 @@ python -m ruff check .
 python -m ruff format --check .
 python -m pytest -q --cov=inference --cov-report=term-missing --cov-fail-under=70
 ```
+
+For versioning policy, the pre-release checklist and manual publication retries, see
+[docs/releasing.md](docs/releasing.md).
 
 ## Operational validation
 
