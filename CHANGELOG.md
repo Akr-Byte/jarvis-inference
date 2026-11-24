@@ -59,7 +59,9 @@
   so a tag pushed from an unmerged feature branch can no longer produce a release.
 - The `llama-server` bind mount now follows `MODEL_DIRECTORY`, so GGUF files can live in the OS home
   directory (`~/models`) or any absolute host path instead of the repository checkout. The installer
-  expands `~` the same way and all model-switching docs use the configured host directory.
+  expands `~` the same way and all model-switching docs use the configured host directory. The
+  installer now discovers GGUFs one directory deep, matching the engine entrypoint's split-shard
+  folders.
 
 ### Performance
 

@@ -14,7 +14,7 @@ def test_install_script_removes_only_stale_application_containers() -> None:
 
 def test_install_script_requires_a_mounted_gguf_model() -> None:
     content = INSTALL.read_text(encoding="utf-8")
-    assert 'gguf_models=("$model_dir"/*.gguf)' in content
+    assert "find \"$model_dir\" -maxdepth 2 -name '*.gguf'" in content
     assert 'model_dir="${MODEL_DIRECTORY:-$ROOT/models}"' in content
     assert "No GGUF model found in $model_dir" in content
     assert "ollama pull" not in content

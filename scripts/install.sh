@@ -52,9 +52,8 @@ model_dir="${MODEL_DIRECTORY:-$ROOT/models}"
 model_dir="${model_dir/#\~/$HOME}"
 [[ "$model_dir" == /* ]] || model_dir="$ROOT/$model_dir"
 
-shopt -s nullglob
-gguf_models=("$model_dir"/*.gguf)
-shopt -u nullglob
+# Match the engine entrypoint: GGUFs may live one level down (split-shard folders).
+mapfile -t gguf_models < <(find "$model_dir" -maxdepth 2 -name '*.gguf' -type f | LC_ALL=C sort)
 (( ${#gguf_models[@]} > 0 )) || {
   fail "No GGUF model found in $model_dir. Copy a .gguf there or set MODEL_DIRECTORY in .env."
 }
