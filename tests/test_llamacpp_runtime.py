@@ -35,6 +35,28 @@ def test_managed_command_carries_workstation_tuning(monkeypatch, tmp_path) -> No
     assert command[command.index("--cache-type-k") + 1] == "q8_0"
 
 
+def test_managed_command_emits_cache_ram_limit_in_bytes(monkeypatch, tmp_path) -> None:
+    """--cache-ram takes bytes; the MB-named setting must be converted before emission."""
+    runtime = LlamaCppRuntime()
+    monkeypatch.setattr(settings, "llamacpp_model", str(tmp_path / "model.gguf"))
+    monkeypatch.setattr(settings, "llamacpp_cache_ram_mib", 4096)
+    runtime.supported_flags = {
+        "--model",
+        "--host",
+        "--port",
+        "--ctx-size",
+        "--threads",
+        "--batch-size",
+        "--ubatch-size",
+        "--cache-ram",
+    }
+
+    command = runtime.command()
+
+    assert "--cache-ram" in command
+    assert command[command.index("--cache-ram") + 1] == str(4096 * 1024**2)
+
+
 def test_managed_command_passes_engine_parity_flags(monkeypatch, tmp_path) -> None:
     """Chat templates, metrics, mlock and reasoning separation are opt-in flags."""
     runtime = LlamaCppRuntime()
@@ -548,6 +570,26 @@ def test_memory_estimate_lists_components_and_rejects_invalid_batch(monkeypatch)
             cache_ram_bytes=0,
             prompt_cache_enabled=False,
         )
+
+
+def test_memory_estimate_includes_speculative_draft_weights(monkeypatch) -> None:
+    from inference.llamacpp_runtime import estimate_runtime_memory
+
+    monkeypatch.setattr("inference.llamacpp_runtime.memory_available_gb", lambda: 64.0)
+    monkeypatch.setattr(settings, "memory_budget_gb", 1.0)
+    estimate = estimate_runtime_memory(
+        model_bytes=1024**3,
+        metadata=_metadata(),
+        context_tokens=4096,
+        parallel_sequences=1,
+        batch_size=512,
+        ubatch_size=128,
+        cache_ram_bytes=256 * 1024**2,
+        prompt_cache_enabled=True,
+        draft_model_bytes=512**3,
+    )
+    assert estimate.components_bytes["draft_weights"] == 512**3
+    assert estimate.estimated_bytes == sum(estimate.components_bytes.values())
 
 
 def test_discovery_groups_complete_split_gguf_shards(tmp_path) -> None:

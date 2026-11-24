@@ -74,6 +74,7 @@ def estimate_runtime_memory(
     ubatch_size: int,
     cache_ram_bytes: int,
     prompt_cache_enabled: bool,
+    draft_model_bytes: int = 0,
 ) -> MemoryEstimate:
     if min(model_bytes, context_tokens, parallel_sequences, batch_size, ubatch_size) <= 0:
         raise ValueError("model size, context, parallelism, and batch sizes must be positive")
@@ -110,6 +111,9 @@ def estimate_runtime_memory(
         "compute_buffers": compute_bytes,
         "runtime_overhead": runtime_bytes,
     }
+    draft_bytes = int(draft_model_bytes) if draft_model_bytes and draft_model_bytes > 0 else 0
+    if draft_bytes:
+        components["draft_weights"] = draft_bytes
     components["uncertainty_reserve"] = max(1024**3, int(sum(components.values()) * 0.20))
     incomplete_notes = (
         "compute buffers and runtime overhead are conservative estimates",
@@ -267,7 +271,9 @@ class LlamaCppRuntime:
             ("--alias", self.active_model_id or settings.llamacpp_alias or None, "alias"),
             (
                 "--cache-ram",
-                str(settings.llamacpp_cache_ram_mib) if settings.llamacpp_cache_ram_mib else None,
+                str(settings.llamacpp_cache_ram_mib * 1024**2)
+                if settings.llamacpp_cache_ram_mib
+                else None,
                 "cache_ram_limit",
             ),
             (
@@ -305,7 +311,12 @@ class LlamaCppRuntime:
             if self._flag_supported("--draft-max-len", "draft_max_len"):
                 cmd.extend(("--draft-max-len", str(settings.llamacpp_draft_max_len)))
             if self._flag_supported("--draft-min-len", "draft_min_len"):
-                cmd.extend(("--draft-min-len", str(settings.llamacpp_draft_min_len)))
+                cmd.extend(
+                    (
+                        "--draft-min-len",
+                        str(min(settings.llamacpp_draft_min_len, settings.llamacpp_draft_max_len)),
+                    )
+                )
         return cmd
 
     def _flag_supported(self, flag: str, capability: str) -> bool:
@@ -418,6 +429,14 @@ class LlamaCppRuntime:
                         "restore every shard before starting the model"
                     )
                 model_bytes = related.size_bytes if related else model_path.stat().st_size
+                draft_model_bytes = 0
+                if settings.llamacpp_draft_model:
+                    draft_path = Path(settings.llamacpp_draft_model).expanduser()
+                    if not draft_path.is_file():
+                        raise RuntimeError(
+                            f"configured speculative-decoding draft model is missing: {draft_path}"
+                        )
+                    draft_model_bytes = draft_path.stat().st_size
                 try:
                     memory_estimate = estimate_runtime_memory(
                         model_bytes=model_bytes,
@@ -428,6 +447,7 @@ class LlamaCppRuntime:
                         ubatch_size=settings.llamacpp_ubatch_size,
                         cache_ram_bytes=settings.llamacpp_cache_ram_mib * 1024**2,
                         prompt_cache_enabled=settings.llamacpp_cache_prompt,
+                        draft_model_bytes=draft_model_bytes,
                     )
                 except ValueError as exc:
                     raise RuntimeError(
