@@ -76,8 +76,10 @@ echo "==> Starting inference services"
 docker compose -f "$COMPOSE_FILE" up -d llama-server jarvis-inference
 
 echo "==> Waiting for llama-server"
+# Large GGUFs can take several minutes to load; match the Compose healthcheck
+# start_period so the installer does not fail while the engine is still loading.
 llama_ready=0
-for _ in {1..60}; do
+for _ in {1..180}; do
   if curl --fail --silent --show-error "http://127.0.0.1:8081/health" >/dev/null 2>&1; then
     llama_ready=1
     break

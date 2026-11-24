@@ -77,3 +77,29 @@ def test_model_manager_rejects_embedding_model_for_chat() -> None:
         manager.validate_chat("nomic-embed-text")
 
     assert exc.value.code == "UNKNOWN_MODEL"
+
+
+@pytest.mark.asyncio
+async def test_llamacpp_refresh_reuses_available_model_catalog() -> None:
+    class CountingLlamaBackend:
+        name = "llama.cpp"
+
+        def __init__(self) -> None:
+            self.available_calls = 0
+            self.loaded_calls = 0
+
+        async def available_models(self) -> list[str]:
+            self.available_calls += 1
+            return ["qwen3:1.7b"]
+
+        async def loaded_models(self) -> list[str]:
+            self.loaded_calls += 1
+            return ["qwen3:1.7b"]
+
+    manager = ModelManager()
+    backend = CountingLlamaBackend()
+
+    assert await manager.refresh(backend, force=True)
+    assert backend.available_calls == 1
+    assert backend.loaded_calls == 0
+    assert manager.status()["loaded_models"] == ["qwen3:1.7b"]

@@ -301,30 +301,43 @@ Engine tuning compared with direct `llama-server` use:
 - Managed mode binds `llama-server` to loopback by default. The engine has no authentication of its
   own, so binding it to a public interface bypasses gateway auth, admission and queueing.
 
-CPU-only performance tuning (recommended for the native workstation profile):
+CPU-only performance tuning (applies to both native managed mode and the default Compose profile):
 
 - Set `LLAMACPP_DRAFT_MODEL` to a small distilled GGUF (for example a 1.5B or 3B draft of the target
-  model) to enable speculative decoding. It maps to llama-server's `--draft-model` when the build
-  supports it; startup skips the flag with a warning when it does not. Draft-then-verify sampling is
-  the largest single lever for CPU-only token generation (often 2-3x on supported models).
+  model) to enable speculative decoding. It maps to `--spec-draft-model` on current llama.cpp builds
+  and falls back to `--draft-model` on older ones; unsupported flags are skipped with a warning.
+  Draft-then-verify sampling is the largest single lever for CPU-only token generation (often 2-3x
+  on supported models).
 - Tune `LLAMACPP_DRAFT_MAX_LEN` (default 5) and `LLAMACPP_DRAFT_MIN_LEN` (default 5) when a draft
-  model is configured; they map to `--draft-max-len` / `--draft-min-len` and only take effect with
-  `--draft-model`. Raise the draft horizon for longer generations, or raise the minimum draft length
-  when the draft model is high quality enough to skip early verification cycles.
+  model is configured; they map to `--spec-draft-n-max` / `--spec-draft-n-min` with legacy fallbacks.
+  Raise the draft horizon for longer generations, or raise the minimum draft length when the draft
+  model is high quality enough to skip early verification cycles.
 - Keep `LLAMACPP_CACHE_TYPE_K` / `LLAMACPP_CACHE_TYPE_V` at a quantized type such as `q8_0` with
   `LLAMACPP_FLASH_ATTENTION=true`; quantized KV halves cache memory bandwidth, which speeds both
-  prefill reuse and decode.
+  prefill reuse and decode. The container entrypoint also enables flash attention automatically
+  when a quantized KV type is configured.
 - Keep `LLAMACPP_CACHE_PROMPT=true` and raise `LLAMACPP_CACHE_REUSE` (tokens) for agent workloads
   that share prefixes across turns.
-- Keep the physical-core thread defaults (no SMT oversubscription) and raise
-  `LLAMACPP_BATCH_SIZE` / `LLAMACPP_UBATCH_SIZE` only after measuring memory headroom; larger logical
-  batches improve prefill SIMD utilization at the cost of batch buffers.
+- Thread defaults use physical cores clamped by the container CPU quota and affinity, avoiding SMT
+  oversubscription. Raise `LLAMACPP_BATCH_SIZE` / `LLAMACPP_UBATCH_SIZE` only after measuring memory
+  headroom; larger logical batches improve prefill SIMD utilization at the cost of batch buffers.
+- `MAX_CONTEXT_LENGTH` defaults to 16384. The engine is started with
+  `--ctx-size MAX_CONTEXT_LENGTH * LLAMACPP_PARALLEL`, so each slot retains the configured context.
+
+In the default Compose profile these values are passed from `.env` into the `llama-server` container
+by `docker-compose.yml`, and the entrypoint capability-probes every optional flag. Use
+`LLAMA_EXTRA_ARGS` for engine flags that do not have a corresponding `LLAMACPP_*` setting. The
+engine port is published on loopback only; the authenticated gateway remains the sole client entry
+point. Resource limits are derived from `LLAMACPP_THREADS` and `MEMORY_BUDGET_GB`.
+
+Run `bash scripts/benchmark.sh` before and after tuning. It reports median total latency, time to
+first token and decode tokens/s for the configured `DEFAULT_MODEL`.
 
 The constrained Ollama example is [.env.constrained-homelab.example](.env.constrained-homelab.example).
-It keeps 8K context, one active generation and the existing Ollama backend. The installer creates
+It keeps 8K context, one active generation and the standalone Ollama backend. The installer creates
 `.env` only when absent, so upgrades do not overwrite user configuration; keep a backup of `.env`
 before editing it. For rollback, restore the previous revision and `.env`, then run
-`bash scripts/install.sh`; the Ollama model volume is preserved.
+`bash scripts/install.sh`; mounted GGUF files are preserved.
 
 ## Production and constrained-host profiles
 
@@ -536,15 +549,12 @@ container after changing the model. The gateway itself normally does not need a 
    cp /path/to/new-model.gguf ./models/
    ```
 
-2. Make model selection deterministic. By default the entrypoint picks the first `*.gguf` it finds,
-   which is not stable if several models are mounted. Set an explicit file in the `llama-server`
-   environment in `docker-compose.yml`:
+2. Pin the file when more than one GGUF is mounted. `docker-compose.yml` forwards `LLAMA_MODEL`, and
+   the entrypoint otherwise picks the first path in sorted order with a warning. Export the path
+   before recreating:
 
-   ```yaml
-   environment:
-     - LLAMA_MODEL_PATH=/models
-     - LLAMA_MODEL=/models/new-model.gguf
-     - LLAMA_ALIAS=${LLAMACPP_ALIAS:-default-model}
+   ```bash
+   export LLAMA_MODEL=/models/new-model.gguf
    ```
 
 3. Recreate the engine container:

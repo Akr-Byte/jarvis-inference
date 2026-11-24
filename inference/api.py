@@ -480,17 +480,21 @@ async def _stream(
         stream = await scheduler.stream(body, request_id=request_id, lease=lease)
         async for line in stream:
             if backend.name == "ollama":
-                try:
-                    data = backend.sse_data(line)
-                except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                    # A malformed backend line must not abort an otherwise
-                    # healthy stream; skip it and keep reading (GW-4a).
-                    logger.warning(
-                        "skipping malformed backend SSE line (request %s): %s",
-                        request_id,
-                        exc,
-                    )
-                    continue
+                # The scheduler already decoded this line for metering. Reuse
+                # that event instead of parsing every token twice.
+                data = getattr(line, "event", None)
+                if not isinstance(data, dict):
+                    try:
+                        data = backend.sse_data(line)
+                    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                        # A malformed backend line must not abort an otherwise
+                        # healthy stream; skip it and keep reading (GW-4a).
+                        logger.warning(
+                            "skipping malformed backend SSE line (request %s): %s",
+                            request_id,
+                            exc,
+                        )
+                        continue
                 message = data.get("message") or {}
                 delta: dict[str, object] = {"content": message.get("content", "")}
                 if message.get("role"):
@@ -580,10 +584,13 @@ async def _stream(
                     # gateway can meter tokens (see LlamaCppBackend.stream).
                     # Clients that did not set stream_options.include_usage
                     # must not receive the usage-only chunk (OpenAI contract).
-                    try:
-                        event = json.loads(stripped)
-                    except (TypeError, ValueError):
-                        event = None
+                    # The scheduler's decoded event is reused when available.
+                    event = getattr(line, "event", None)
+                    if not isinstance(event, dict):
+                        try:
+                            event = json.loads(stripped)
+                        except (TypeError, ValueError):
+                            event = None
                     if isinstance(event, dict) and event.get("usage") and not event.get("choices"):
                         continue
                 yield f"data: {line}\n\n"

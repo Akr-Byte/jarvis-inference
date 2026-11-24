@@ -1,4 +1,4 @@
-from inference.config import Settings
+from inference.config import Settings, _available_cores
 
 
 def test_settings_parse_environment(monkeypatch) -> None:
@@ -81,3 +81,28 @@ def test_model_map_registers_multiple_runtime_profiles(monkeypatch) -> None:
     }
     assert settings.models == ("coder", "chat")
     assert settings.default_model == "coder"
+
+
+def test_context_default_matches_documented_limit(monkeypatch) -> None:
+    monkeypatch.delenv("MAX_CONTEXT_LENGTH", raising=False)
+
+    settings = Settings()
+
+    assert settings.max_context_length == 16384
+
+
+def test_active_backend_reports_ollama_without_llamacpp(monkeypatch) -> None:
+    monkeypatch.setenv("INFERENCE_BACKEND", "ollama")
+    monkeypatch.setenv("LLAMACPP_MANAGED", "false")
+    monkeypatch.delenv("LLAMACPP_URL", raising=False)
+
+    settings = Settings()
+
+    assert settings.active_backend == "ollama"
+
+
+def test_available_cores_respects_cgroup_quota(monkeypatch) -> None:
+    monkeypatch.setattr("inference.config._physical_cores", lambda: 8)
+    monkeypatch.setattr("inference.config._cpu_quota", lambda: 2)
+
+    assert _available_cores() == 2

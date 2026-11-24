@@ -37,6 +37,17 @@ from inference.models import model_manager
 from inference.resources import admit_request
 
 
+class StreamLine(str):
+    """A raw SSE line carrying its decoded JSON event for downstream reuse."""
+
+    event: dict[str, Any] | None
+
+    def __new__(cls, raw: str, event: dict[str, Any] | None) -> StreamLine:
+        obj = super().__new__(cls, raw)
+        obj.event = event
+        return obj
+
+
 @dataclass
 class StreamLease:
     """An admitted streaming request whose slot must be released exactly once."""
@@ -44,6 +55,7 @@ class StreamLease:
     model: str
     request_id: str
     released: bool = False
+    payload: dict[str, Any] | None = None
 
 
 # Keys that do not belong to the rendered prompt. Kept in one place so the
@@ -107,12 +119,14 @@ def _check_context_window(
     actual_prompt_tokens: int | None = None,
     *,
     estimated_prompt_tokens: int | None = None,
-) -> None:
-    """Reject requests that cannot fit the effective context window (GW-6).
+) -> dict[str, Any]:
+    """Return a payload that fits the effective context window (GW-6).
 
-    llama.cpp's tokenizer route counts the rendered chat prompt when present.
-    Otherwise this uses a UTF-8 JSON byte-length heuristic, which is explicitly
-    an estimate and may differ from the backend tokenizer.
+    Oversized multi-message chats are compacted by dropping the oldest
+    non-system messages; the returned payload is the one callers must forward
+    to the backend. A single oversized message cannot be compacted and is
+    rejected. llama.cpp's tokenizer route counts the rendered chat prompt when
+    present; otherwise a UTF-8 JSON byte-length heuristic is used.
     """
     effective, output_budget = _context_limits(payload)
     estimated = (
@@ -121,70 +135,48 @@ def _check_context_window(
         else estimate_prompt_tokens(_prompt_payload(payload) or payload.get("messages", []))
     )
     prompt_tokens = actual_prompt_tokens if actual_prompt_tokens is not None else estimated
-    CONTEXT_USAGE.labels(model=str(payload.get("model") or settings.default_model)).observe(
-        (prompt_tokens + output_budget) / effective
-    )
-    if prompt_tokens + output_budget > effective:
-        # Attempt context compaction: trim oldest messages, keeping system prompt + newest
-        messages = payload.get("messages", [])
-        if messages and len(messages) > 1:
-            # Keep system prompt + newest messages only
-            system_msg = None
-            conversation = []
-            for msg in messages:
-                if msg.get("role") == "system":
-                    system_msg = msg
-                else:
-                    conversation.append(msg)
+    model_label = str(payload.get("model") or settings.default_model)
+    CONTEXT_USAGE.labels(model=model_label).observe((prompt_tokens + output_budget) / effective)
+    if prompt_tokens + output_budget <= effective:
+        return payload
 
-            # Keep system + newest messages, removing oldest first
-            kept = [system_msg] if system_msg else []
-            # Try adding messages from the end (newest) backwards
-            test_kept = kept
-            for older_msg in reversed(conversation):
-                test_kept = test_kept + [older_msg]
-                # Estimate tokens
-                escaped = json.dumps(test_kept, ensure_ascii=True)
-                byte_est = (len(escaped.encode("utf-8")) + 2) // 3
-                groups = 0
-                in_word = False
-                prompt = json.dumps(test_kept, ensure_ascii=False)
-                for char in prompt:
-                    if char.isalnum() or ord(char) > 127:
-                        if not in_word:
-                            groups += 1
-                        in_word = True
-                    elif char.isspace():
-                        in_word = False
-                    else:
-                        groups += 1
-                        in_word = False
-                est = max(byte_est, groups)
-
-                if est <= effective - output_budget:
-                    kept = test_kept
-                else:
-                    break
-
-            # Recursively check with trimmed messages
-            payload_copy = dict(payload)
-            payload_copy["messages"] = kept
-            _check_context_window(
-                payload_copy, actual_prompt_tokens=None, estimated_prompt_tokens=None
+    messages = payload.get("messages", [])
+    if len(messages) > 1:
+        system = [msg for msg in messages if msg.get("role") == "system"]
+        conversation = [msg for msg in messages if msg.get("role") != "system"]
+        system_tokens = sum(estimate_prompt_tokens([msg]) for msg in system)
+        newest_first: list[dict[str, Any]] = []
+        running = system_tokens
+        for msg in reversed(conversation):
+            msg_tokens = estimate_prompt_tokens([msg])
+            if running + msg_tokens + output_budget > effective:
+                break
+            newest_first.append(msg)
+            running += msg_tokens
+        compacted_messages = system + list(reversed(newest_first))
+        if len(compacted_messages) < len(messages):
+            compacted = dict(payload)
+            compacted["messages"] = compacted_messages
+            compacted_tokens = estimate_prompt_tokens(
+                _prompt_payload(compacted) or compacted_messages
             )
-            return
+            CONTEXT_USAGE.labels(model=model_label).observe(
+                (compacted_tokens + output_budget) / effective
+            )
+            if compacted_tokens + output_budget <= effective:
+                return compacted
 
-        count_label = (
-            "tokenizer-counted prompt" if actual_prompt_tokens is not None else "estimated prompt"
-        )
-        raise InferenceError(
-            "CONTEXT_LIMIT_EXCEEDED",
-            f"{count_label} ({prompt_tokens} tokens) plus output budget ({output_budget} tokens) "
-            f"exceeds the {effective} token context window; shorten the conversation or "
-            "adjust MAX_CONTEXT_LENGTH/MAX_OUTPUT_TOKENS",
-            False,
-            400,
-        )
+    count_label = (
+        "tokenizer-counted prompt" if actual_prompt_tokens is not None else "estimated prompt"
+    )
+    raise InferenceError(
+        "CONTEXT_LIMIT_EXCEEDED",
+        f"{count_label} ({prompt_tokens} tokens) plus output budget ({output_budget} tokens) "
+        f"exceeds the {effective} token context window; shorten the conversation or "
+        "adjust MAX_CONTEXT_LENGTH/MAX_OUTPUT_TOKENS",
+        False,
+        400,
+    )
 
 
 def estimate_prompt_tokens(messages: Any) -> int:
@@ -209,7 +201,7 @@ def estimate_prompt_tokens(messages: Any) -> int:
     return max(byte_estimate, groups)
 
 
-async def _admit_context_window(payload: dict[str, Any], backend: Any) -> None:
+async def _admit_context_window(payload: dict[str, Any], backend: Any) -> dict[str, Any]:
     model = str(payload.get("model") or settings.default_model)
     effective, output_budget = _context_limits(payload)
     estimated = estimate_prompt_tokens(_prompt_payload(payload) or payload.get("messages", []))
@@ -218,11 +210,12 @@ async def _admit_context_window(payload: dict[str, Any], backend: Any) -> None:
         # verdict, and the extra request would serialize on the engine's
         # tokenizer before every generation (a measurable TTFT cost for long
         # prompts). Keep the cheap heuristic for admission and metrics.
-        _check_context_window(payload, estimated_prompt_tokens=estimated)
-        return
+        return _check_context_window(payload, estimated_prompt_tokens=estimated)
     tokenizer = getattr(backend, "count_chat_tokens", None)
     actual = await tokenizer(model, payload) if tokenizer else None
-    _check_context_window(payload, actual_prompt_tokens=actual, estimated_prompt_tokens=estimated)
+    return _check_context_window(
+        payload, actual_prompt_tokens=actual, estimated_prompt_tokens=estimated
+    )
 
 
 class Scheduler:
@@ -357,10 +350,12 @@ class Scheduler:
         """Age after which an active slot must belong to an abandoned request.
 
         Chat, stream and embedding calls are all bounded by wait_for timeouts,
-        so a slot held for 1.5x the longest of those timeouts can only be a
-        leaked stream whose cleanup never ran.
+        so a slot held shortly beyond the longest of those timeouts can only be
+        a leaked stream whose cleanup never ran. Reclaim quickly enough that a
+        single abandoned stream cannot stall the only configured slot for
+        minutes.
         """
-        return 1.5 * max(settings.chat_timeout_seconds, settings.stream_timeout_seconds)
+        return 1.1 * max(settings.chat_timeout_seconds, settings.stream_timeout_seconds)
 
     def sweep_stale(self) -> list[str]:
         """Reclaim slots held by abandoned requests (GW-15).
@@ -401,7 +396,7 @@ class Scheduler:
 
     async def _sweep_loop(self) -> None:
         while True:
-            await asyncio.sleep(max(1.0, self.stale_request_seconds / 3.0))
+            await asyncio.sleep(min(30.0, max(5.0, self.stale_request_seconds / 10.0)))
             self.sweep_stale()
 
     def _backend_failure(self, exc: InferenceError) -> None:
@@ -554,7 +549,7 @@ class Scheduler:
     async def chat(self, payload: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
         model = str(payload.get("model") or settings.default_model)
         model_manager.validate_chat(model)
-        await _admit_context_window(payload, self.backend)
+        payload = await _admit_context_window(payload, self.backend)
         payload = dict(payload)
         payload.setdefault("max_tokens", settings.max_output_tokens)
         request_id = request_id or self._new_request_id()
@@ -641,7 +636,7 @@ class Scheduler:
         """Admit a stream before HTTP headers are committed by StreamingResponse."""
         model = str(payload.get("model") or settings.default_model)
         model_manager.validate_chat(model)
-        await _admit_context_window(payload, self.backend)
+        payload = await _admit_context_window(payload, self.backend)
         payload = dict(payload)
         payload.setdefault("max_tokens", settings.max_output_tokens)
         request_id = request_id or self._new_request_id()
@@ -669,7 +664,7 @@ class Scheduler:
                 raise
             model_manager.activate(model, warm)
             self._activate_model(model)
-            lease = StreamLease(model=model, request_id=request_id)
+            lease = StreamLease(model=model, request_id=request_id, payload=payload)
             lease_created = True
             return lease
         except asyncio.CancelledError:
@@ -701,7 +696,7 @@ class Scheduler:
     ) -> AsyncIterator[str]:
         """Return a streaming iterator, admitting the request before the first body byte."""
         prepared = lease or await self.prepare_stream(payload, request_id)
-        return self._stream_prepared(payload, prepared)
+        return self._stream_prepared(prepared.payload or payload, prepared)
 
     async def _stream_prepared(
         self, payload: dict[str, Any], lease: StreamLease
@@ -724,13 +719,15 @@ class Scheduler:
                         try:
                             event = json.loads(line)
                         except (TypeError, ValueError):
-                            event = {}
+                            event = None
+                        if not isinstance(event, dict):
+                            event = None
                         if line.strip() == "[DONE]":
                             # llama.cpp ends OpenAI-style streams with the
                             # [DONE] sentinel instead of Ollama's done event
                             # (GW-21).
                             saw_done = True
-                        if event.get("done"):
+                        if event and event.get("done"):
                             saw_done = True
                             load = float(event.get("load_duration") or 0) / 1e9
                             generation = float(event.get("eval_duration") or 0) / 1e9
@@ -745,7 +742,7 @@ class Scheduler:
                                     TOKENS_PER_SECOND.labels(model=model).observe(
                                         completion / generation
                                     )
-                        openai_usage = event.get("usage")
+                        openai_usage = event.get("usage") if event else None
                         if isinstance(openai_usage, dict) and openai_usage:
                             # OpenAI-style usage chunk (llama.cpp with
                             # stream_options.include_usage); it always
@@ -757,7 +754,9 @@ class Scheduler:
                                 TOKENS.labels(model=model, kind="prompt").inc(prompt)
                             if completion:
                                 TOKENS.labels(model=model, kind="completion").inc(completion)
-                        yield line
+                        # Pass the already-decoded event to the API layer so a
+                        # per-token SSE line is never parsed twice.
+                        yield StreamLine(line, event)
                 if not saw_done:
                     # A backend stream that ends without its terminal event is
                     # an incomplete generation, not a success (GW-20).

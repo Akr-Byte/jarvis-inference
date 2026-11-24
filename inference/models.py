@@ -67,7 +67,12 @@ class ModelManager:
                 return True
             try:
                 available = set(await backend.available_models())
-                loaded = set(await backend.loaded_models())
+                if getattr(backend, "name", "") == "llama.cpp":
+                    # llama-server exposes exactly one model via /v1/models.
+                    # loaded_models() is the same call, so reuse the response.
+                    loaded = set(available)
+                else:
+                    loaded = set(await backend.loaded_models())
             except Exception:
                 return False
             now = time.monotonic()

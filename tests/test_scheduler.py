@@ -709,3 +709,34 @@ async def test_llamacpp_embeddings_require_explicit_capability(monkeypatch) -> N
 
     assert caught.value.code == "CAPABILITY_UNSUPPORTED"
     await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_oversized_chat_forwards_compacted_payload(scheduler: Scheduler, monkeypatch) -> None:
+    """Compaction must change the payload the backend actually receives."""
+    monkeypatch.setattr(settings, "max_context_length", 512)
+    monkeypatch.setattr(settings, "max_output_tokens", 16)
+
+    class CapturingBackend(FakeBackend):
+        def __init__(self) -> None:
+            self.payload: dict | None = None
+
+        async def chat(self, model: str, payload: dict) -> dict:
+            self.payload = dict(payload)
+            return await super().chat(model, payload)
+
+    backend = CapturingBackend()
+    scheduler._ollama = backend
+    await scheduler.chat(
+        {
+            "model": "qwen3:1.7b",
+            "messages": [
+                {"role": "system", "content": "SYS"},
+                {"role": "user", "content": "x" * 3000},
+                {"role": "user", "content": "NEW"},
+            ],
+        }
+    )
+
+    assert backend.payload is not None
+    assert [message["content"] for message in backend.payload["messages"]] == ["SYS", "NEW"]

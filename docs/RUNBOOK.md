@@ -59,14 +59,11 @@ gateway normally does not need a restart as long as the public alias stays the s
    cp /path/to/new-model.gguf ./models/
    ```
 
-2. Pin the file in `docker-compose.yml` so selection is deterministic. Without `LLAMA_MODEL`, the
-   entrypoint uses the first `*.gguf` it finds:
+2. Pin the file when several GGUFs are mounted. Compose forwards `LLAMA_MODEL`; otherwise the
+   entrypoint selects the first path in sorted order and warns:
 
-   ```yaml
-   environment:
-     - LLAMA_MODEL_PATH=/models
-     - LLAMA_MODEL=/models/new-model.gguf
-     - LLAMA_ALIAS=${LLAMACPP_ALIAS:-default-model}
+   ```bash
+   export LLAMA_MODEL=/models/new-model.gguf
    ```
 
 3. Recreate the engine, then verify:
@@ -88,6 +85,30 @@ Native managed mode is still available for workstation deployments that set
 `LLAMACPP_MANAGED=true` and let the gateway supervise its own llama-server child. In that mode the
 authenticated `/v1/runtime/status`, `/v1/runtime/capabilities` and model load/unload endpoints can
 switch among configured `LLAMACPP_MODEL_MAP` profiles without restarting the gateway.
+
+## Performance verification
+
+Tuning only counts if it improves the deployed profile. Run the benchmark before and after a change:
+
+```bash
+bash scripts/benchmark.sh
+```
+
+It uses `DEFAULT_MODEL` from `.env` and reports median total latency, time to first token and decode
+tokens/s. Useful engine-side checks:
+
+```bash
+# llama-server Prometheus metrics are enabled by LLAMACPP_METRICS=true.
+curl -sS http://127.0.0.1:8081/metrics | grep -E 'llama:|cache|prompt|tokens' | head -50
+
+# Effective runtime flags in the container process list.
+docker compose exec llama-server ps -o args= -p 1
+```
+
+Compare `decode_tokens_per_s` after changing threads, draft models, KV quantization or cache reuse.
+Keep `MAX_CONCURRENT_REQUESTS <= LLAMACPP_PARALLEL`; extra gateway concurrency only queues inside
+llama-server. Quantized KV types (`q8_0`, `q4_0`, ...) require flash attention; the container
+entrypoint enables it automatically and skips unsupported flags with a warning.
 
 ## Update
 

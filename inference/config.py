@@ -30,6 +30,39 @@ def _physical_cores() -> int:
         return 8
 
 
+def _cpu_quota() -> int | None:
+    """Return the effective CPU quota when the process is container-limited."""
+    try:
+        values = Path("/sys/fs/cgroup/cpu.max").read_text(encoding="utf-8").split()
+        if len(values) == 2 and values[0] != "max":
+            quota, period = int(values[0]), int(values[1])
+            if period > 0:
+                return max(1, quota // period)
+    except (OSError, ValueError):
+        pass
+    try:
+        quota = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text(encoding="utf-8"))
+        period = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text(encoding="utf-8"))
+        if quota > 0 and period > 0:
+            return max(1, quota // period)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _available_cores() -> int:
+    """Physical cores bounded by cgroup quota and CPU affinity."""
+    cores = _physical_cores()
+    quota = _cpu_quota()
+    if quota is not None:
+        cores = min(cores, quota)
+    try:
+        cores = min(cores, len(os.sched_getaffinity(0)))
+    except AttributeError:  # pragma: no cover - non-Linux
+        pass
+    return max(1, cores)
+
+
 def _model_id_from_path(value: str) -> str:
     stem = Path(value).expanduser().stem
     return re.sub(r"-\d{5}-of-\d{5}$", "", stem)
@@ -153,10 +186,10 @@ class Settings:
     llamacpp_host: str = field(default_factory=lambda: os.getenv("LLAMACPP_HOST", "127.0.0.1"))
     llamacpp_port: int = field(default_factory=lambda: _int("LLAMACPP_PORT", 8081))
     llamacpp_threads: int = field(
-        default_factory=lambda: max(1, _int("LLAMACPP_THREADS", _physical_cores()))
+        default_factory=lambda: max(1, _int("LLAMACPP_THREADS", _available_cores()))
     )
     llamacpp_batch_threads: int = field(
-        default_factory=lambda: max(1, _int("LLAMACPP_BATCH_THREADS", _physical_cores()))
+        default_factory=lambda: max(1, _int("LLAMACPP_BATCH_THREADS", _available_cores()))
     )
     llamacpp_batch_size: int = field(
         default_factory=lambda: max(1, _int("LLAMACPP_BATCH_SIZE", 512))
@@ -270,7 +303,7 @@ class Settings:
         )
     )
     max_context_length: int = field(
-        default_factory=lambda: max(512, _int("MAX_CONTEXT_LENGTH", 131072))
+        default_factory=lambda: max(512, _int("MAX_CONTEXT_LENGTH", 16384))
     )
     max_output_tokens: int = field(default_factory=lambda: max(1, _int("MAX_OUTPUT_TOKENS", 2048)))
     max_embedding_batch_size: int = field(
@@ -297,7 +330,7 @@ class Settings:
             return "ollama"
         if self.backend == "llamacpp":
             return "llama.cpp"
-        return "llama.cpp" if self.llamacpp_base_url else "llama.cpp"
+        return "llama.cpp" if self.llamacpp_base_url else "ollama"
 
     @property
     def llamacpp_model_map(self) -> dict[str, str]:

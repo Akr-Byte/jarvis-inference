@@ -809,11 +809,14 @@ def validate_runtime_tuning() -> None:
             settings.max_concurrent_requests,
             settings.llamacpp_parallel,
         )
-    logical = psutil.cpu_count(logical=True) or 1
+    try:
+        logical = len(os.sched_getaffinity(0))
+    except AttributeError:  # pragma: no cover - non-Linux
+        logical = psutil.cpu_count(logical=True) or 1
     if settings.llamacpp_threads > logical:
         logger.warning(
-            "LLAMACPP_THREADS (%s) exceeds the %s logical CPUs; threading above the physical core "
-            "count usually reduces tokens/s",
+            "LLAMACPP_THREADS (%s) exceeds the %s CPUs available to this process; threading above "
+            "the physical core count usually reduces tokens/s",
             settings.llamacpp_threads,
             logical,
         )

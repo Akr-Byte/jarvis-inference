@@ -66,6 +66,23 @@
 - The body-limit middleware is pure ASGI: no per-request wrapper task, and streaming responses
   keep their disconnect semantics.
 - llama.cpp HTTP connection limits scale with gateway concurrency instead of a fixed pool of two.
+- The containerized llama-server now receives the full `LLAMACPP_*` tuning set from `.env`. The
+  entrypoint capability-probes renamed flags, sizes context as
+  `MAX_CONTEXT_LENGTH * LLAMACPP_PARALLEL`, enables flash attention for quantized KV caches, and
+  supports speculative decoding on both current `--spec-draft-*` and legacy `--draft-*` builds.
+- Thread defaults are clamped by cgroup CPU quota and process affinity, avoiding SMT oversubscription
+  inside resource-limited containers.
+- Oversized multi-message chats are compacted once by dropping the oldest non-system messages and
+  the compacted payload is actually forwarded to the engine; the previous implementation discarded
+  its trimmed copy and re-estimated every suffix.
+- llama.cpp model-state refreshes reuse the `/v1/models` response instead of issuing a second
+  identical request for `loaded_models()`.
+- Stale stream slots are reclaimed at 1.1x the configured timeout with a 5-30s sweep, instead of
+  1.5x with a 150s sweep that could stall the only slot for minutes.
+- `scripts/benchmark.sh` reads `DEFAULT_MODEL` from `.env` and reports time to first token and
+  decode tokens/s in addition to total latency.
+- SSE lines are decoded once by the scheduler and the parsed event is attached to the streamed line,
+  so the API layer no longer re-parses every token to decide whether to suppress a usage chunk.
 
 ### Fixed
 
@@ -77,6 +94,18 @@
 - `llama-server` healthchecks use `CMD-SHELL`, and the entrypoint passes an explicit `--port 8080`
   and the configured model alias, so Compose dependency gating and gateway model discovery work
   reliably.
+- `MAX_CONTEXT_LENGTH` now defaults to the documented 16384 tokens in code and environment examples;
+  llama-server receives an explicit `--ctx-size` matching the gateway admission limit.
+- `Settings.active_backend` now reports `ollama` when no llama.cpp URL or managed child is configured
+  instead of always reporting `llama.cpp`.
+- GGUF selection is sorted and warns when multiple models are mounted; the engine port is published
+  on loopback and the engine container has CPU, memory and PID limits.
+- `LLAMACPP_CACHE_RAM_MIB` is passed to `llama-server --cache-ram` in MiB rather than bytes, matching
+  the engine's documented unit.
+- Speculative-decoding sampling flags are only forwarded when `LLAMACPP_DRAFT_MODEL` is set, so a
+  target-only engine never receives draft parameters.
+- The installer waits up to six minutes for `llama-server` health, matching the extended Compose
+  startup window for large GGUF loads.
 
 ## 0.5.1
 
