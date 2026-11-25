@@ -206,7 +206,7 @@ directory read-only at `/models`; the container selects the first GGUF and expos
 | `LLAMACPP_RESTART_ENABLED` / `LLAMACPP_MAX_RESTARTS` | `true` / `5` | Bounded recovery after unexpected child exits. |
 | `OLLAMA_KEEP_ALIVE` | `30m` | Backend model residency. |
 | `MAX_CONTEXT_LENGTH` | `16384` | Hard context cap applied before queue admission. |
-| `MAX_OUTPUT_TOKENS` | `2048` | Default and maximum configured output budget; prompt plus output must fit context. |
+| `MAX_OUTPUT_TOKENS` | `2048` | Default and maximum configured output budget; prompt plus output must fit context, and client output limits (e.g. OpenCode `limit.output`) must not exceed it. |
 | `MAX_EMBEDDING_BATCH_SIZE` | `64` | Inputs per embedding batch. |
 | `INFERENCE_CPUS` / `INFERENCE_MEMORY_LIMIT` | `0.4` / `1g` | Gateway container CPU/memory caps (constrained-host profile). |
 | `OLLAMA_CPUS` / `OLLAMA_MEMORY_LIMIT` | `1.5` / `8g` | Backend container CPU/memory caps (constrained-host profile). |

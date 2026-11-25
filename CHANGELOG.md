@@ -62,7 +62,8 @@
   expands `~` the same way and all model-switching docs use the configured host directory. The
   installer now discovers GGUFs one directory deep, matching the engine entrypoint's split-shard
   folders. `.env.example` and the configuration table now document `LLAMA_MODEL` separately from the
-  native-mode `LLAMACPP_MODEL`, since the containerized engine needs an in-container path.
+  native-mode `LLAMACPP_MODEL`, since the containerized engine needs an in-container path. Added a
+  note that client output limits must not exceed `MAX_OUTPUT_TOKENS`.
 
 ### Performance
 
