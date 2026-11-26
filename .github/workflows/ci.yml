@@ -36,3 +36,4 @@ jobs:
           name: certification-evidence-${{ github.sha }}
           path: certification-evidence.json
           if-no-files-found: error
+          retention-days: 1
