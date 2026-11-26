@@ -1,5 +1,6 @@
 import asyncio
 import time
+from typing import Any
 
 import pytest
 
@@ -7,7 +8,13 @@ from inference.config import settings
 from inference.errors import InferenceError
 from inference.metrics import ACTIVE_MODEL
 from inference.models import model_manager
-from inference.scheduler import Scheduler
+from inference.scheduler import (
+    Scheduler,
+    StreamLease,
+    _admit_context_window,
+    _check_context_window,
+    estimate_prompt_tokens,
+)
 
 
 class FakeBackend:
@@ -530,3 +537,262 @@ async def test_sweeper_task_starts_and_close_cancels_it(scheduler: Scheduler) ->
 
     assert task.done()
     assert scheduler._sweeper_task is None
+
+
+class OpenAIStyleBackend(FakeBackend):
+    """A llama.cpp-style backend that streams OpenAI-format SSE chunks."""
+
+    name = "llama.cpp"
+
+    async def stream(self, model: str, payload: dict):
+        yield '{"choices":[{"delta":{"content":"hi"}}]}'
+        yield (
+            '{"choices":[{"delta":{},"finish_reason":"stop"}],'
+            '"usage":{"prompt_tokens":3,"completion_tokens":2}}'
+        )
+        yield "[DONE]"
+
+
+@pytest.mark.asyncio
+async def test_openai_style_stream_completes_without_stream_incomplete(
+    scheduler: Scheduler, monkeypatch
+) -> None:
+    """GW-21: llama.cpp streams end with [DONE], not Ollama's done event.
+
+    Before the fix, `saw_done` stayed False and every llama.cpp stream was
+    reported as STREAM_INCOMPLETE (502) after generating normally.
+    """
+    monkeypatch.setattr(settings, "llamacpp_url", "http://llama")
+    scheduler._llama = OpenAIStyleBackend()
+    lease = await scheduler.prepare_stream({"model": "qwen3:1.7b", "messages": []})
+
+    lines = []
+    async for line in scheduler._stream_prepared({"model": "qwen3:1.7b"}, lease):
+        lines.append(line)
+
+    assert lines[-1] == "[DONE]"
+    assert scheduler.status()["queue_depth"] == 0
+
+
+def test_context_admission_supports_128k_and_reserves_output(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "max_context_length", 131072)
+    monkeypatch.setattr(settings, "max_output_tokens", 8192)
+
+    _check_context_window(
+        {
+            "model": "qwen3:1.7b",
+            "messages": [{"role": "user", "content": "x" * 90000}],
+            "num_ctx": 131072,
+            "max_tokens": 8192,
+        }
+    )
+    with pytest.raises(InferenceError, match=r"prompt \("):
+        _check_context_window(
+            {
+                "model": "qwen3:1.7b",
+                "messages": [{"role": "user", "content": "x" * 400000}],
+                "num_ctx": 131072,
+                "max_tokens": 8192,
+            }
+        )
+
+
+class TokenCountingBackend(FakeBackend):
+    def __init__(self) -> None:
+        self.counts = 0
+
+    async def count_chat_tokens(self, model: str, payload: dict) -> int:
+        self.counts += 1
+        return 1
+
+
+@pytest.mark.asyncio
+async def test_context_admission_skips_tokenizer_far_below_window(
+    monkeypatch, scheduler: Scheduler
+) -> None:
+    """The extra engine tokenization round-trip only runs near the limit."""
+    monkeypatch.setattr(settings, "max_context_length", 8192)
+    monkeypatch.setattr(settings, "max_output_tokens", 512)
+    backend = TokenCountingBackend()
+    scheduler._ollama = backend
+
+    await scheduler.chat(
+        {"model": "qwen3:1.7b", "messages": [{"role": "user", "content": "hello"}]}
+    )
+
+    assert backend.counts == 0
+
+
+@pytest.mark.asyncio
+async def test_context_admission_uses_tokenizer_near_window(
+    monkeypatch, scheduler: Scheduler
+) -> None:
+    monkeypatch.setattr(settings, "max_context_length", 1024)
+    monkeypatch.setattr(settings, "max_output_tokens", 64)
+    backend = TokenCountingBackend()
+    scheduler._ollama = backend
+
+    await scheduler.chat(
+        {"model": "qwen3:1.7b", "messages": [{"role": "user", "content": "x" * 4000}]}
+    )
+
+    assert backend.counts == 1
+
+
+@pytest.mark.asyncio
+async def test_active_model_gauge_tracks_concurrency(monkeypatch, scheduler: Scheduler) -> None:
+    class BarrierBackend(FakeBackend):
+        def __init__(self) -> None:
+            self.seen: list[int] = []
+            self._arrived = 0
+            self._both_running = asyncio.Event()
+
+        async def chat(self, model: str, payload: dict) -> dict:
+            self.seen.append(ACTIVE_MODEL.labels(model=model)._value.get())
+            self._arrived += 1
+            if self._arrived >= 2:
+                self._both_running.set()
+            await self._both_running.wait()
+            return await super().chat(model, payload)
+
+    backend = BarrierBackend()
+    scheduler._ollama = backend
+    scheduler._semaphore = asyncio.Semaphore(2)
+
+    await asyncio.gather(
+        scheduler.chat({"model": "qwen3:1.7b", "messages": []}),
+        scheduler.chat({"model": "qwen3:1.7b", "messages": []}),
+    )
+
+    assert max(backend.seen) == 2
+    assert ACTIVE_MODEL.labels(model="qwen3:1.7b")._value.get() == 0
+
+
+def test_context_heuristic_handles_multilingual_and_code_as_estimates(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "max_context_length", 8192)
+    monkeypatch.setattr(settings, "max_output_tokens", 512)
+    multilingual = [{"role": "user", "content": "こんにちは 世界 مرحبا بالعالم"}]
+    code = [
+        {
+            "role": "user",
+            "content": "def f(x):\n    return {'a': x**2, 'b': [i for i in range(20)]}",
+        }
+    ]
+
+    assert estimate_prompt_tokens(multilingual) > 0
+    assert estimate_prompt_tokens(code) > 0
+    assert estimate_prompt_tokens(
+        {"messages": [], "tools": [{"name": "search", "schema": "x" * 90}]}
+    ) > estimate_prompt_tokens({"messages": []})
+    # A tokenizer result, when provided, is used as an actual count and named
+    # separately from the byte-length fallback in admission diagnostics.
+    with pytest.raises(InferenceError, match="tokenizer-counted prompt"):
+        _check_context_window(
+            {"messages": code, "num_ctx": 100, "max_tokens": 20},
+            actual_prompt_tokens=90,
+        )
+
+
+def test_runtime_maintenance_blocks_inference_admission() -> None:
+    scheduler = Scheduler()
+    assert scheduler.begin_runtime_maintenance()
+    with pytest.raises(InferenceError) as caught:
+        scheduler._enqueue()
+    assert caught.value.code == "RUNTIME_MAINTENANCE"
+    scheduler.end_runtime_maintenance()
+    scheduler._enqueue()
+    assert scheduler.status()["queue_depth"] == 1
+
+
+@pytest.mark.asyncio
+async def test_llamacpp_embeddings_require_explicit_capability(monkeypatch) -> None:
+    scheduler = Scheduler()
+    monkeypatch.setattr(settings, "llamacpp_url", "http://llama")
+    monkeypatch.setattr(settings, "llamacpp_managed", False)
+    monkeypatch.setattr(settings, "llamacpp_embeddings", False)
+
+    with pytest.raises(InferenceError) as caught:
+        await scheduler.embeddings(settings.embedding_model, ["hello"])
+
+    assert caught.value.code == "CAPABILITY_UNSUPPORTED"
+    await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_oversized_chat_forwards_compacted_payload(scheduler: Scheduler, monkeypatch) -> None:
+    """Compaction must change the payload the backend actually receives."""
+    monkeypatch.setattr(settings, "max_context_length", 512)
+    monkeypatch.setattr(settings, "max_output_tokens", 16)
+
+    class CapturingBackend(FakeBackend):
+        def __init__(self) -> None:
+            self.payload: dict | None = None
+
+        async def chat(self, model: str, payload: dict) -> dict:
+            self.payload = dict(payload)
+            return await super().chat(model, payload)
+
+    backend = CapturingBackend()
+    scheduler._ollama = backend
+    await scheduler.chat(
+        {
+            "model": "qwen3:1.7b",
+            "messages": [
+                {"role": "system", "content": "SYS"},
+                {"role": "user", "content": "x" * 3000},
+                {"role": "user", "content": "NEW"},
+            ],
+        }
+    )
+
+    assert backend.payload is not None
+    assert [message["content"] for message in backend.payload["messages"]] == ["SYS", "NEW"]
+
+
+@pytest.mark.asyncio
+async def test_compacted_payload_is_reverified_by_tokenizer(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "max_context_length", 512)
+    monkeypatch.setattr(settings, "max_output_tokens", 16)
+
+    class TokenizerBackend:
+        name = "llama.cpp"
+
+        def __init__(self) -> None:
+            self.counts: list[dict[str, Any]] = []
+
+        async def count_chat_tokens(self, model: str, payload: dict) -> int:
+            self.counts.append(dict(payload))
+            return 900 if len(payload["messages"]) == 3 else 100
+
+    backend = TokenizerBackend()
+    payload = {
+        "model": "qwen3:1.7b",
+        "messages": [
+            {"role": "system", "content": "SYS"},
+            {"role": "user", "content": "x" * 3000},
+            {"role": "user", "content": "NEW"},
+        ],
+    }
+
+    admitted = await _admit_context_window(payload, backend)
+
+    assert [message["content"] for message in admitted["messages"]] == ["SYS", "NEW"]
+    assert len(backend.counts) == 2
+
+
+@pytest.mark.asyncio
+async def test_stale_sweep_cancels_abandoned_stream_task(scheduler: Scheduler) -> None:
+    async def sleeper() -> None:
+        await asyncio.sleep(60)
+
+    task = asyncio.create_task(sleeper())
+    lease = StreamLease(model="qwen3:1.7b", request_id="inf-1", task=task)
+    scheduler._leases["inf-1"] = lease
+    stale_age = 1.5 * max(settings.chat_timeout_seconds, settings.stream_timeout_seconds) + 10
+    await scheduler._semaphore.acquire()
+    scheduler._active["inf-1"] = _active_entry("inf-1", stale_age)
+
+    assert scheduler.sweep_stale() == ["inf-1"]
+    assert lease.released
+    await asyncio.gather(task, return_exceptions=True)
+    assert task.cancelled()

@@ -51,9 +51,10 @@ def container_memory_available_gb() -> float:
 def memory_available_gb() -> float:
     """Return memory available to the model runtime admission policy.
 
-    Model execution happens in the sibling Ollama container, so the gateway
-    cgroup is not the model's capacity. Use host availability bounded by the
-    explicitly configured gateway admission budget instead.
+    The managed native runtime shares host memory with the gateway; Ollama and
+    external llama-server deployments may execute elsewhere. Use host
+    availability bounded by the explicit runtime/admission budget instead of
+    assuming the API process cgroup represents model capacity.
     """
     host_available = psutil.virtual_memory().available / 1024**3
     return max(0.0, min(host_available, settings.memory_budget_gb))

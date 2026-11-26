@@ -4,8 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jarvis-inference"
-version = "0.5.0"
+version = "0.6.0"
 description = "Production-grade local inference gateway for the Jarvis stack"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi==0.165.0",
@@ -42,3 +43,4 @@ known-first-party = ["inference"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = ["integration: opt-in tests that exercise a locally configured model and runtime"]

@@ -2,11 +2,10 @@
 
 **Production-grade local inference gateway for the Jarvis stack.**
 
-[![CI](https://github.com/abdullahalrifat/jarvis-inference/actions/workflows/ci.yml/badge.svg)](https://github.com/abdullahalrifat/jarvis-inference/actions/workflows/ci.yml)
-[![Release](https://github.com/abdullahalrifat/jarvis-inference/releases/badge.svg)](https://github.com/abdullahalrifat/jarvis-inference/releases)
-[![PyPI](https://img.shields.io/pypi/v/jarvis-inference)](https://pypi.org/project/jarvis-inference/)
+[![CI](https://github.com/Akr-Byte/jarvis-inference/actions/workflows/ci.yml/badge.svg)](https://github.com/Akr-Byte/jarvis-inference/actions/workflows/ci.yml)
+[![Release](https://github.com/Akr-Byte/jarvis-inference/releases/badge.svg)](https://github.com/Akr-Byte/jarvis-inference/releases)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
-[![Status](https://img.shields.io/badge/status-beta-blue)](https://github.com/abdullahalrifat/jarvis-inference/releases)
+[![Status](https://img.shields.io/badge/status-beta-blue)](https://github.com/Akr-Byte/jarvis-inference/releases)
 
 The dedicated inference VM owns model execution for the Jarvis stack. This repository is the
 OpenAI-compatible HTTP gateway: an agent-facing API that schedules bounded generations against a
@@ -19,7 +18,7 @@ local model backend (Ollama, or an optional llama.cpp server) and speaks the Ope
 - Jarvis remains usable for local repository work when AI Stack is stopped, and AI Stack remains
   usable when the CLI is not installed.
 
-**Current release: `0.5.0`** — see [CHANGELOG.md](CHANGELOG.md) for release notes.
+**Current release: `0.6.0`** — see [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Table of contents
 
@@ -45,8 +44,9 @@ local model backend (Ollama, or an optional llama.cpp server) and speaks the Ope
 
 ## Overview
 
-`jarvis-inference` is a production-grade, CPU-only inference gateway for small local language
-models. It exposes an OpenAI-compatible API:
+`jarvis-inference` is a local inference gateway and runtime supervisor. It exposes an
+OpenAI-compatible API while keeping model policy, admission and process lifecycle outside the
+inference engine:
 
 - `POST /v1/chat/completions` — chat completions with optional streaming (SSE), tool calls and
   reasoning content.
@@ -54,6 +54,11 @@ models. It exposes an OpenAI-compatible API:
 - `GET /v1/models` — model listing for the configured registry.
 - `GET /v1/capabilities` — capability advertisement for clients.
 - `GET /v1/inference/status` — in-process inference/runtime status.
+- `GET /v1/runtime/status` and `/v1/runtime/capabilities` — authenticated engine process state and
+  probed llama.cpp options.
+- `GET /v1/model-registry` and `GET /v1/models/{id}` — authenticated discovered, registered,
+  available and loaded model metadata.
+- `POST /v1/models/{id}/load` and `/unload` — authenticated idle-only managed model lifecycle.
 - `GET /health` and `GET /ready` — liveness and readiness probes.
 - `GET /metrics` — Prometheus metrics.
 
@@ -80,8 +85,10 @@ Jarvis CLI (local agent)           AI Stack (optional remote control plane)
                              v
                      jarvis-inference
                      OpenAI-compatible API
-                             |
-                           Ollama
+                       /            \
+              Ollama adapter    llama.cpp adapter
+                                    |
+                         managed or external process
 ```
 
 The dedicated inference VM owns model execution. Jarvis and AI Stack are independent sibling
@@ -89,22 +96,32 @@ consumers of the gateway; neither consumer runs Ollama or LiteLLM. Jarvis local 
 usable when AI Stack is stopped. The gateway owns the model allowlist, bounded queue, concurrency,
 backend timeouts and resource limits.
 
+Ollama remains an inference engine with its own model store and lifecycle. llama.cpp supplies the
+GGUF runtime and optimized kernels; in native managed mode Jarvis starts and supervises its
+`llama-server` process while leaving tensor execution and KV/prompt caching inside llama.cpp.
+External llama-server and Ollama workflows remain supported through independent HTTP adapters.
+
 ## Quick start
 
 Requirements: Docker Engine, Docker Compose v2 and `curl`.
 
 ```bash
-git clone https://github.com/abdullahalrifat/jarvis-inference.git
+git clone https://github.com/Akr-Byte/jarvis-inference.git
 cd jarvis-inference
 cp .env.example .env
 chmod 600 .env
+# llama-server mounts MODEL_DIRECTORY read-only at /models (default ./models, or ~/models
+# in the shipped .env) and uses the first *.gguf file found there.
+mkdir -p ~/models
+cp /path/to/model.gguf ~/models/
 # Set INFERENCE_BIND_ADDRESS=0.0.0.0 and a long INFERENCE_API_KEY for remote access.
 bash scripts/install.sh
 ```
 
-The installer validates Docker/Compose, validates the Compose file, builds the gateway, starts
-Ollama, ensures configured models are present, waits for readiness, and runs authenticated smoke
-checks.
+The installer validates Docker/Compose, checks that a GGUF model is mounted, builds the bundled
+llama-server image and the gateway, starts both services, waits for readiness, and runs
+authenticated smoke checks. The llama-server binary is installed inside its image; no host binary
+is required. Ollama remains available through `docker-compose.ollama.yml`.
 
 Verify the deployment:
 
@@ -136,7 +153,12 @@ bash scripts/install.sh
 ## Configuration
 
 All runtime settings come from environment variables (see [`.env.example`](.env.example) for the full
-surface). Highlights:
+surface). The default `docker-compose.yml` runs llama-server in its own container and sets
+`LLAMACPP_MANAGED=false` plus `LLAMACPP_URL=http://llama-server:8080` for the gateway, regardless of
+the values in `.env`. Place a GGUF in `MODEL_DIRECTORY` on the host (default `./models`; set it to
+`~/models` or an absolute path to use a directory outside the checkout). Compose bind-mounts that
+directory read-only at `/models`; the container selects the first GGUF and exposes it under
+`LLAMACPP_ALIAS` (default `default-model`). Highlights:
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -148,7 +170,8 @@ surface). Highlights:
 | `MAX_CONCURRENT_REQUESTS` | `1` | Active inference slots. |
 | `MAX_QUEUE_SIZE` | `8` | Waiting requests; the active generation is tracked separately. |
 | `MAX_LOADED_MODELS` | `1` | Backend-side loaded models. |
-| `MEMORY_BUDGET_GB` / `MEMORY_HEADROOM_GB` | `10` / `1.0` | Gateway memory budget and headroom. |
+| `MEMORY_BUDGET_GB` / `MEMORY_HEADROOM_GB` | `10` / `1.0` | Runtime/admission RAM budget and safety headroom. |
+| `MODEL_MEMORY_ESTIMATE_GB` | `0` | Optional operator supplied minimum model/runtime memory estimate; `0` uses GGUF weights plus calculated KV. |
 | `BACKEND_HTTP_TIMEOUT_SECONDS` | `600` | Backend (Ollama/llama.cpp) request timeout. |
 | `QUEUE_TIMEOUT_SECONDS` | `90` | Waiting time before an unslotted request is rejected. |
 | `EMBEDDING_TIMEOUT_SECONDS` | `30` | Embedding request timeout. |
@@ -159,8 +182,31 @@ surface). Highlights:
 | `CIRCUIT_FAILURE_THRESHOLD` / `CIRCUIT_RECOVERY_SECONDS` | `3` / `15` | Circuit breaker thresholds. |
 | `OLLAMA_URL` | `http://ollama:11434` | Backend base URL. |
 | `LLAMACPP_URL` | *(empty)* | Optional llama.cpp backend URL. |
+| `LLAMACPP_MANAGED` | `false` | Launch and supervise a local llama-server child. |
+| `LLAMACPP_MODEL` / `LLAMACPP_ALIAS` | *(empty)* | Native managed mode GGUF file or first split shard, and public model ID. |
+| `LLAMA_MODEL` | *(empty)* | Containerized engine's GGUF path **inside** the container (`/models/...`). Empty auto-selects the first GGUF; pin it to skip incompatible or split models. |
+| `LLAMACPP_MODEL_MAP` | *(empty)* | Optional `id=/path/model.gguf;id2=/path/other.gguf` profiles for managed model switching. |
+| `MODEL_DIRECTORY` | `~/models` | Host directory mounted at `/models` in the engine container; also the recursive scan root for native managed mode. `~` is expanded to the OS home. |
+| `LLAMACPP_THREADS` / `LLAMACPP_BATCH_THREADS` | physical cores | Generation and prompt-processing CPU threads; defaults avoid SMT oversubscription. |
+| `LLAMACPP_BATCH_SIZE` / `LLAMACPP_UBATCH_SIZE` | `512` / `128` | llama.cpp logical batch and micro-batch; larger values trade memory for prefill throughput. |
+| `LLAMACPP_PARALLEL` | `1` | llama-server slots; keep `MAX_CONCURRENT_REQUESTS <= LLAMACPP_PARALLEL`. |
+| `LLAMACPP_GPU_LAYERS` | `0` | Layers offloaded to a GPU build; `99` offloads everything on a discrete GPU. |
+| `LLAMACPP_DRAFT_MODEL` | *(empty)* | Optional speculative-decoding draft GGUF path; enables `--draft-model` when the build supports it. |
+| `LLAMACPP_DRAFT_MAX_LEN` / `LLAMACPP_DRAFT_MIN_LEN` | `5` / `5` | Speculative-decoding draft sampling bounds; emitted only when a draft model is configured. |
+| `LLAMACPP_DRAFT_CTX_SIZE` | `0` | Optional speculative-decoding draft context size; emits `--draft-ctx-size` only when set. |
+| `LLAMACPP_JINJA` | `true` | Use the model's own chat template (tool calls, roles, reasoning extraction). |
+| `LLAMACPP_METRICS` | `true` | Expose llama-server's Prometheus endpoint (slot/cache/token telemetry). |
+| `LLAMACPP_MLOCK` | `false` | Lock model weights in RAM on CPU workstations; avoid on memory-constrained hosts. |
+| `LLAMACPP_REASONING_FORMAT` | *(empty)* | `auto`, `none` or `deepseek`; separates reasoning from content in streamed deltas. |
+| `LLAMACPP_CACHE_PROMPT` / `LLAMACPP_CACHE_RAM_MIB` | `true` / `0` | Prompt-cache switch and optional RAM bound. |
+| `LLAMACPP_CACHE_REUSE` | `0` | Minimum chunk size (tokens) for prefix reuse between related prompts. |
+| `LLAMACPP_CACHE_TYPE_K` / `LLAMACPP_CACHE_TYPE_V` | *(empty)* | Optional quantized KV cache types; llama.cpp requires flash attention for quantized caches. |
+| `LLAMACPP_STARTUP_TIMEOUT_SECONDS` | `300` | Health-gate deadline for loading a large GGUF. |
+| `LLAMACPP_EMBEDDINGS` | `false` | Enable llama.cpp embedding mode only when the configured model/profile supports it. Ollama embeddings stay enabled by default. |
+| `LLAMACPP_RESTART_ENABLED` / `LLAMACPP_MAX_RESTARTS` | `true` / `5` | Bounded recovery after unexpected child exits. |
 | `OLLAMA_KEEP_ALIVE` | `30m` | Backend model residency. |
-| `MAX_CONTEXT_LENGTH` | `8192` | Hard context cap applied before queue admission. |
+| `MAX_CONTEXT_LENGTH` | `16384` | Hard context cap applied before queue admission. |
+| `MAX_OUTPUT_TOKENS` | `2048` | Default and maximum configured output budget; prompt plus output must fit context, and client output limits (e.g. OpenCode `limit.output`) must not exceed it. |
 | `MAX_EMBEDDING_BATCH_SIZE` | `64` | Inputs per embedding batch. |
 | `INFERENCE_CPUS` / `INFERENCE_MEMORY_LIMIT` | `0.4` / `1g` | Gateway container CPU/memory caps (constrained-host profile). |
 | `OLLAMA_CPUS` / `OLLAMA_MEMORY_LIMIT` | `1.5` / `8g` | Backend container CPU/memory caps (constrained-host profile). |
@@ -168,6 +214,134 @@ surface). Highlights:
 
 `MAX_REQUEST_BODY_MIB` (default `8`) bounds request-body size and is enforced before validation;
 prompts that do not fit the effective context are rejected with `CONTEXT_LIMIT_EXCEEDED` at admission.
+
+### Native Linux llama.cpp workstation
+
+Install the build tools and OpenBLAS on Ubuntu, then build llama.cpp’s official server target:
+
+```sh
+sudo apt update
+sudo apt install -y build-essential cmake git libopenblas-dev
+git clone https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
+cmake -S /tmp/llama.cpp -B /tmp/llama.cpp/build -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS
+cmake --build /tmp/llama.cpp/build --config Release --target llama-server -j "$(nproc)"
+sudo install -m 0755 /tmp/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
+```
+
+The official [llama.cpp build guide](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
+documents CPU/BLAS options. Copy
+`.env.workstation.example` to `.env`, set `LLAMACPP_MODEL` to a local GGUF file, choose a model
+alias and tune the memory/context values to fit the workstation. For split GGUFs, point the model
+path at the first shard (the `...00001-of-....gguf` file); llama.cpp resolves the sibling shards.
+
+Install and launch the gateway natively:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e .
+set -a
+. .env
+set +a
+uvicorn inference.main:app --host "$INFERENCE_HOST" --port "$INFERENCE_PORT"
+```
+
+With `LLAMACPP_MANAGED=true`, the gateway starts only the child process it created, sends its
+output to `LLAMACPP_LOG_FILE`, checks `/health` before serving, restarts that child after an
+unexpected exit up to `LLAMACPP_MAX_RESTARTS`, and terminates that child during shutdown. It probes
+the executable's `--help` output before using optional flags. Startup reads GGUF context and KV
+metadata and rejects contexts beyond a declared model context or estimated memory beyond the
+configured budget and headroom. Incomplete KV metadata is rejected rather than treated as a safe
+estimate. It never discovers, adopts or signals an independently started `llama-server`.
+Leave `LLAMACPP_MANAGED=false` and set `LLAMACPP_URL` to use an externally supervised server. The
+default Ollama deployment remains unchanged.
+
+For multiple manually registered GGUFs, configure `LLAMACPP_MODEL_MAP` with semicolon-separated
+`public-id=/path/to/model.gguf` pairs and set `MODEL_REGISTRY`/`DEFAULT_MODEL` accordingly. Runtime
+switching is serialized and rejected while requests are active or queued. Authenticated operators
+can inspect `/v1/model-registry`, `/v1/runtime/status`, `/v1/runtime/capabilities`, and
+`/v1/models/{id}`; load and unload use `POST /v1/models/{id}/load` and `/unload`. Discovery reports
+on-disk models separately from registered, available and loaded models. Optional flags and cache
+telemetry are reported honestly; cache hit counts are not inferred.
+
+Example OpenAI-compatible client settings use base URL `http://127.0.0.1:8080/v1`, the model ID
+from `MODEL_REGISTRY`, and `INFERENCE_API_KEY` as the API key. For a direct smoke check:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Authorization: Bearer $INFERENCE_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"workstation-model","messages":[{"role":"user","content":"Reply with OK"}],"max_tokens":32}'
+```
+
+Managed llama.cpp estimates memory from GGUF file size, architecture-specific KV and recurrent
+state metadata, configured cache limits, and estimated batch/compute/runtime reserves. Runtime
+status reports each component and observed child RSS separately; these estimates are not actual or
+guaranteed process consumption. Missing or inconsistent Qwen3-Next hybrid metadata fails admission
+because a conventional all-attention estimate would be misleading. Context admission uses llama.cpp's
+rendered-chat token-count endpoint when supported; otherwise the JSON UTF-8 byte-length heuristic
+is explicitly an estimate, and backend usage remains the actual usage when provided.
+`MAX_CONTEXT_LENGTH` is the per-request context. Managed mode sizes llama-server's total context
+pool as `MAX_CONTEXT_LENGTH * LLAMACPP_PARALLEL`, so each configured slot retains the requested
+per-request context and memory admission accounts for every slot.
+
+Engine tuning compared with direct `llama-server` use:
+
+- `--jinja` (default on) keeps the model's chat template, which is what makes tool calling,
+  role handling and reasoning separation behave like other OpenAI-compatible engines. Disabling it
+  is advertised as a degraded configuration at startup.
+- Token accounting asks the engine for a terminal usage chunk on every stream, so the gateway can
+  meter completion tokens even when the client did not set `stream_options.include_usage`; the
+  usage-only chunk is forwarded only to clients that opted in.
+- Exact tokenizer-based context admission is only performed near the window (80% or more of the
+  context plus output budget). Shorter prompts use the heuristic and skip the extra engine
+  round-trip, which keeps time-to-first-token low for long conversations.
+- Model discovery caches parsed GGUF headers by path, size and modification time and skips
+  materialising tokenizer vocabulary arrays, so registry and status endpoints no longer re-parse
+  every model on each request (a 150k-token vocabulary alone costs ~20 ms per scan).
+- Gateway concurrency should match `LLAMACPP_PARALLEL`; a mismatch is reported at startup because
+  excess requests would otherwise queue inside `llama-server` and hit gateway timeouts instead of a
+  clean `429`.
+- Managed mode binds `llama-server` to loopback by default. The engine has no authentication of its
+  own, so binding it to a public interface bypasses gateway auth, admission and queueing.
+
+CPU-only performance tuning (applies to both native managed mode and the default Compose profile):
+
+- Set `LLAMACPP_DRAFT_MODEL` to a small distilled GGUF (for example a 1.5B or 3B draft of the target
+  model) to enable speculative decoding. It maps to `--spec-draft-model` on current llama.cpp builds
+  and falls back to `--draft-model` on older ones; unsupported flags are skipped with a warning.
+  Draft-then-verify sampling is the largest single lever for CPU-only token generation (often 2-3x
+  on supported models).
+- Tune `LLAMACPP_DRAFT_MAX_LEN` (default 5) and `LLAMACPP_DRAFT_MIN_LEN` (default 5) when a draft
+  model is configured; they map to `--spec-draft-n-max` / `--spec-draft-n-min` with legacy fallbacks.
+  Raise the draft horizon for longer generations, or raise the minimum draft length when the draft
+  model is high quality enough to skip early verification cycles.
+- Keep `LLAMACPP_CACHE_TYPE_K` / `LLAMACPP_CACHE_TYPE_V` at a quantized type such as `q8_0` with
+  `LLAMACPP_FLASH_ATTENTION=true`; quantized KV halves cache memory bandwidth, which speeds both
+  prefill reuse and decode. The container entrypoint also enables flash attention automatically
+  when a quantized KV type is configured.
+- Keep `LLAMACPP_CACHE_PROMPT=true` and raise `LLAMACPP_CACHE_REUSE` (tokens) for agent workloads
+  that share prefixes across turns.
+- Thread defaults use physical cores clamped by the container CPU quota and affinity, avoiding SMT
+  oversubscription. Raise `LLAMACPP_BATCH_SIZE` / `LLAMACPP_UBATCH_SIZE` only after measuring memory
+  headroom; larger logical batches improve prefill SIMD utilization at the cost of batch buffers.
+- `MAX_CONTEXT_LENGTH` defaults to 16384. The engine is started with
+  `--ctx-size MAX_CONTEXT_LENGTH * LLAMACPP_PARALLEL`, so each slot retains the configured context.
+
+In the default Compose profile these values are passed from `.env` into the `llama-server` container
+by `docker-compose.yml`, and the entrypoint capability-probes every optional flag. Use
+`LLAMA_EXTRA_ARGS` for engine flags that do not have a corresponding `LLAMACPP_*` setting. The
+engine port is published on loopback only; the authenticated gateway remains the sole client entry
+point. Resource limits are derived from `LLAMACPP_THREADS` and `MEMORY_BUDGET_GB`.
+
+Run `bash scripts/benchmark.sh` before and after tuning. It reports median total latency, time to
+first token and decode tokens/s for the configured `DEFAULT_MODEL`.
+
+The constrained Ollama example is [.env.constrained-homelab.example](.env.constrained-homelab.example).
+It keeps 8K context, one active generation and the standalone Ollama backend. The installer creates
+`.env` only when absent, so upgrades do not overwrite user configuration; keep a backup of `.env`
+before editing it. For rollback, restore the previous revision and `.env`, then run
+`bash scripts/install.sh`; mounted GGUF files are preserved.
 
 ## Production and constrained-host profiles
 
@@ -187,7 +361,7 @@ reloads when alternating between `qwen3:1.7b` and `nomic-embed-text`, but benchm
 first; do not increase it blindly because `qwen3:4b` and context memory also compete for the 8-GiB
 Ollama limit.
 
-For CPU-only deployments, `MAX_CONTEXT_LENGTH` defaults to 8192 and request-level `num_ctx` overrides
+For CPU-only deployments, `MAX_CONTEXT_LENGTH` defaults to 16384 and request-level `num_ctx` overrides
 above that cap are rejected before queue admission. `MAX_EMBEDDING_BATCH_SIZE` defaults to 64 inputs per
 request to bound memory and latency; split larger ingestion jobs into smaller batches. Raise either
 limit only after measuring peak RAM and throughput on the target VM.
@@ -197,7 +371,7 @@ Both profiles preserve:
 - One active generation
 - One loaded model
 - Queue size 8 waiting requests (active generation is separate)
-- Context length 8192
+- Context length 16384
 - Ollama keep-alive 30 minutes
 
 Configured models:
@@ -251,7 +425,7 @@ All commands below are run from the repository root on the dedicated inference V
 Install Docker Engine and Docker Compose v2 first, then:
 
 ```bash
-git clone https://github.com/abdullahalrifat/jarvis-inference.git
+git clone https://github.com/Akr-Byte/jarvis-inference.git
 cd jarvis-inference
 cp .env.example .env
 chmod 600 .env
@@ -335,10 +509,10 @@ View gateway logs:
 docker compose logs --tail=200 jarvis-inference
 ```
 
-View Ollama logs:
+View llama-server logs:
 
 ```bash
-docker compose logs --tail=200 ollama
+docker compose logs --tail=200 llama-server
 ```
 
 Follow logs:
@@ -353,10 +527,72 @@ Restart only the gateway:
 docker compose restart jarvis-inference
 ```
 
+Restart the engine:
+
+```bash
+docker compose restart llama-server
+```
+
 Restart both services:
 
 ```bash
-docker compose restart ollama jarvis-inference
+docker compose restart llama-server jarvis-inference
+```
+
+#### Changing the mounted model while the stack is running
+
+`llama-server` loads exactly one GGUF when its process starts. The gateway's
+`/v1/models/{id}/load` and `/unload` endpoints require native managed mode
+(`LLAMACPP_MANAGED=true` inside the gateway), which the default Compose stack does not use because
+the engine runs in its own container. Therefore there is **no hot swap**: restart the engine
+container after changing the model. The gateway itself normally does not need a restart.
+
+1. Put the new GGUF in the host `MODEL_DIRECTORY` (`./models` by default, `~/models` in the shipped
+   `.env`):
+
+   ```bash
+   cp /path/to/new-model.gguf ~/models/
+   ```
+
+2. Pin the file when more than one GGUF is mounted. `docker-compose.yml` forwards `LLAMA_MODEL`, and
+   the entrypoint otherwise picks the first path in sorted order with a warning. Export the path
+   before recreating:
+
+   ```bash
+   export LLAMA_MODEL=/models/new-model.gguf
+   ```
+
+3. Recreate the engine container:
+
+   ```bash
+   docker compose up -d --force-recreate llama-server
+   ```
+
+   If the environment and mounted files did not change, a plain restart is enough:
+
+   ```bash
+   docker compose restart llama-server
+   ```
+
+4. Verify:
+
+   ```bash
+   curl -s http://127.0.0.1:8081/health
+   curl -s http://127.0.0.1:8080/ready
+   ```
+
+The gateway refreshes its catalog every `MODEL_REFRESH_SECONDS` (15s), so the same alias recovers
+automatically. If you also change the public model identity, update these together in `.env` and
+recreate both services:
+
+```env
+LLAMACPP_ALIAS=new-model
+MODEL_REGISTRY=new-model
+DEFAULT_MODEL=new-model
+```
+
+```bash
+docker compose up -d --force-recreate llama-server jarvis-inference
 ```
 
 ### 5. Shut down the inference stack
@@ -533,6 +769,9 @@ python -m ruff check .
 python -m ruff format --check .
 python -m pytest -q --cov=inference --cov-report=term-missing --cov-fail-under=70
 ```
+
+For versioning policy, the pre-release checklist and manual publication retries, see
+[docs/releasing.md](docs/releasing.md).
 
 ## Operational validation
 

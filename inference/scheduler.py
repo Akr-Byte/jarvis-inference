@@ -19,6 +19,7 @@ from inference.metrics import (
     BACKEND_ERRORS,
     CANCELLED_REQUESTS,
     CIRCUIT_STATE,
+    CONTEXT_USAGE,
     GENERATION_DURATION,
     LATENCY,
     MODEL_LOAD,
@@ -36,6 +37,17 @@ from inference.models import model_manager
 from inference.resources import admit_request
 
 
+class StreamLine(str):
+    """A raw SSE line carrying its decoded JSON event for downstream reuse."""
+
+    event: dict[str, Any] | None
+
+    def __new__(cls, raw: str, event: dict[str, Any] | None) -> StreamLine:
+        obj = super().__new__(cls, raw)
+        obj.event = event
+        return obj
+
+
 @dataclass
 class StreamLease:
     """An admitted streaming request whose slot must be released exactly once."""
@@ -43,16 +55,40 @@ class StreamLease:
     model: str
     request_id: str
     released: bool = False
+    payload: dict[str, Any] | None = None
+    task: asyncio.Task[Any] | None = None
+
+    def cancel(self) -> None:
+        """Cancel the task driving this stream, if it is still running."""
+        if self.task is not None and not self.task.done():
+            self.task.cancel()
 
 
-def _check_context_window(payload: dict[str, Any]) -> None:
-    """Reject requests that cannot fit the effective context window (GW-6).
+# Keys that do not belong to the rendered prompt. Kept in one place so the
+# heuristic estimate and the exact tokenizer count agree on the payload.
+_NON_PROMPT_KEYS = frozenset(
+    {
+        "max_tokens",
+        "max_completion_tokens",
+        "num_ctx",
+        "stream",
+        "stream_options",
+        "temperature",
+        "top_p",
+        "top_k",
+        "seed",
+        "stop",
+        "presence_penalty",
+        "frequency_penalty",
+    }
+)
+# Below this fraction of the context window an exact tokenizer count cannot
+# change admission, so the extra engine round-trip is skipped.
+TOKENIZER_ADMISSION_RATIO = 0.8
 
-    Only an explicit num_ctx override was checked before; the actual prompt
-    was never measured, so oversized prompts were silently truncated by the
-    backend with HTTP 200. The estimate is deliberately conservative
-    (escaped characters count) for admission purposes.
-    """
+
+def _context_limits(payload: dict[str, Any]) -> tuple[int, int]:
+    """Return the effective context window and the reserved output budget."""
     requested_context = payload.get("num_ctx")
     if requested_context is not None and int(requested_context) > settings.max_context_length:
         raise InferenceError(
@@ -64,17 +100,154 @@ def _check_context_window(payload: dict[str, Any]) -> None:
     effective = (
         int(requested_context) if requested_context is not None else settings.max_context_length
     )
-    messages = payload.get("messages", [])
-    estimated = (len(json.dumps(messages).encode("utf-8")) + 2) // 3
-    if estimated > effective:
+    requested_output = payload.get("max_tokens")
+    if requested_output is None:
+        requested_output = payload.get("max_completion_tokens")
+    output_budget = (
+        int(requested_output) if requested_output is not None else settings.max_output_tokens
+    )
+    if output_budget > settings.max_output_tokens:
         raise InferenceError(
-            "CONTEXT_LIMIT_EXCEEDED",
-            f"estimated prompt size {estimated} tokens exceeds the "
-            f"{effective} token context window; shorten the conversation or "
-            "raise MAX_CONTEXT_LENGTH",
+            "OUTPUT_LIMIT_EXCEEDED",
+            f"max_tokens cannot exceed the configured limit of {settings.max_output_tokens}",
             False,
             400,
         )
+    return effective, output_budget
+
+
+def _prompt_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in payload.items() if key not in _NON_PROMPT_KEYS}
+
+
+def _compact_payload(
+    payload: dict[str, Any], effective: int, output_budget: int
+) -> dict[str, Any] | None:
+    """Return a suffix-only candidate that fits the heuristic budget, if one exists."""
+    messages = payload.get("messages", [])
+    if len(messages) <= 1:
+        return None
+    system = [msg for msg in messages if msg.get("role") == "system"]
+    conversation = [msg for msg in messages if msg.get("role") != "system"]
+    running = sum(estimate_prompt_tokens([msg]) for msg in system)
+    newest_first: list[dict[str, Any]] = []
+    for msg in reversed(conversation):
+        msg_tokens = estimate_prompt_tokens([msg])
+        if running + msg_tokens + output_budget > effective:
+            break
+        newest_first.append(msg)
+        running += msg_tokens
+    compacted_messages = system + list(reversed(newest_first))
+    if len(compacted_messages) >= len(messages):
+        return None
+    compacted = dict(payload)
+    compacted["messages"] = compacted_messages
+    compacted_tokens = estimate_prompt_tokens(_prompt_payload(compacted) or compacted_messages)
+    if compacted_tokens + output_budget > effective:
+        return None
+    return compacted
+
+
+def _check_context_window(
+    payload: dict[str, Any],
+    actual_prompt_tokens: int | None = None,
+    *,
+    estimated_prompt_tokens: int | None = None,
+    allow_compaction: bool = True,
+) -> dict[str, Any]:
+    """Return a payload that fits the effective context window (GW-6).
+
+    Oversized multi-message chats are compacted by dropping the oldest
+    non-system messages; the returned payload is the one callers must forward
+    to the backend. A single oversized message cannot be compacted and is
+    rejected. Set ``allow_compaction=False`` when an exact tokenizer already
+    rejected the original prompt so a heuristic cannot re-admit it.
+    """
+    effective, output_budget = _context_limits(payload)
+    estimated = (
+        estimated_prompt_tokens
+        if estimated_prompt_tokens is not None
+        else estimate_prompt_tokens(_prompt_payload(payload) or payload.get("messages", []))
+    )
+    prompt_tokens = actual_prompt_tokens if actual_prompt_tokens is not None else estimated
+    model_label = str(payload.get("model") or settings.default_model)
+    CONTEXT_USAGE.labels(model=model_label).observe((prompt_tokens + output_budget) / effective)
+    if prompt_tokens + output_budget <= effective:
+        return payload
+
+    if allow_compaction:
+        compacted = _compact_payload(payload, effective, output_budget)
+        if compacted is not None:
+            compacted_tokens = estimate_prompt_tokens(
+                _prompt_payload(compacted) or compacted.get("messages", [])
+            )
+            CONTEXT_USAGE.labels(model=model_label).observe(
+                (compacted_tokens + output_budget) / effective
+            )
+            return compacted
+
+    count_label = (
+        "tokenizer-counted prompt" if actual_prompt_tokens is not None else "estimated prompt"
+    )
+    raise InferenceError(
+        "CONTEXT_LIMIT_EXCEEDED",
+        f"{count_label} ({prompt_tokens} tokens) plus output budget ({output_budget} tokens) "
+        f"exceeds the {effective} token context window; shorten the conversation or "
+        "adjust MAX_CONTEXT_LENGTH/MAX_OUTPUT_TOKENS",
+        False,
+        400,
+    )
+
+
+def estimate_prompt_tokens(messages: Any) -> int:
+    """Estimate serialized prompt/tool bytes; this is not tokenizer output."""
+    escaped = json.dumps(messages, ensure_ascii=True)
+    prompt = json.dumps(messages, ensure_ascii=False)
+    byte_estimate = (len(escaped.encode("utf-8")) + 2) // 3
+    # Count every punctuation run character separately to reduce undercounting
+    # code, JSON schemas and operator-heavy prompts. This remains a heuristic.
+    groups = 0
+    in_word = False
+    for char in prompt:
+        if char.isalnum() or ord(char) > 127:
+            if not in_word:
+                groups += 1
+            in_word = True
+        elif char.isspace():
+            in_word = False
+        else:
+            groups += 1
+            in_word = False
+    return max(byte_estimate, groups)
+
+
+async def _admit_context_window(payload: dict[str, Any], backend: Any) -> dict[str, Any]:
+    model = str(payload.get("model") or settings.default_model)
+    effective, output_budget = _context_limits(payload)
+    estimated = estimate_prompt_tokens(_prompt_payload(payload) or payload.get("messages", []))
+    if estimated + output_budget <= effective * TOKENIZER_ADMISSION_RATIO:
+        # Comfortably inside the window: an exact count cannot change the
+        # verdict, and the extra request would serialize on the engine's
+        # tokenizer before every generation (a measurable TTFT cost for long
+        # prompts). Keep the cheap heuristic for admission and metrics.
+        return _check_context_window(payload, estimated_prompt_tokens=estimated)
+    tokenizer = getattr(backend, "count_chat_tokens", None)
+    actual = await tokenizer(model, payload) if tokenizer else None
+    if tokenizer and actual is not None and actual + output_budget > effective:
+        candidate = _compact_payload(payload, effective, output_budget)
+        if candidate is not None:
+            verified = await tokenizer(model, candidate)
+            if verified is not None and verified + output_budget <= effective:
+                CONTEXT_USAGE.labels(model=model).observe((verified + output_budget) / effective)
+                return candidate
+    # A heuristic must not re-admit a prompt the engine's tokenizer rejected;
+    # when no exact count is available, the heuristic is still the best signal.
+    return _check_context_window(
+        payload,
+        actual_prompt_tokens=actual,
+        estimated_prompt_tokens=estimated,
+        allow_compaction=actual is None,
+    )
 
 
 class Scheduler:
@@ -84,26 +257,35 @@ class Scheduler:
         self._ollama = OllamaBackend()
         self._llama = LlamaCppBackend()
         self._active: dict[str, dict[str, Any]] = {}
+        self._leases: dict[str, StreamLease] = {}
+        self._model_active: dict[str, int] = {}
         self._request_counter = 0
         self._sweeper_task: asyncio.Task[None] | None = None
+        self._runtime_maintenance = False
         self._circuits = {
             "ollama": CircuitBreaker(
-                settings.circuit_failure_threshold, settings.circuit_recovery_seconds
+                settings.circuit_failure_threshold,
+                settings.circuit_recovery_seconds,
+                settings.circuit_trial_timeout_seconds,
             ),
             "llama.cpp": CircuitBreaker(
-                settings.circuit_failure_threshold, settings.circuit_recovery_seconds
+                settings.circuit_failure_threshold,
+                settings.circuit_recovery_seconds,
+                settings.circuit_trial_timeout_seconds,
             ),
         }
 
     @property
     def backend(self) -> OllamaBackend | LlamaCppBackend:
-        return self._llama if settings.llamacpp_url else self._ollama
+        return self._llama if settings.llamacpp_base_url else self._ollama
 
     @property
     def circuit(self) -> CircuitBreaker:
         if self.backend.name not in self._circuits:
             self._circuits[self.backend.name] = CircuitBreaker(
-                settings.circuit_failure_threshold, settings.circuit_recovery_seconds
+                settings.circuit_failure_threshold,
+                settings.circuit_recovery_seconds,
+                settings.circuit_trial_timeout_seconds,
             )
         return self._circuits[self.backend.name]
 
@@ -112,6 +294,13 @@ class Scheduler:
         return f"inf-{self._request_counter:08d}"
 
     def _enqueue(self) -> None:
+        if self._runtime_maintenance:
+            raise InferenceError(
+                "RUNTIME_MAINTENANCE",
+                "The inference runtime is being changed; retry shortly",
+                True,
+                503,
+            )
         try:
             self._queue.put_nowait(object())
         except asyncio.QueueFull as exc:
@@ -175,15 +364,31 @@ class Scheduler:
         else:
             ACTIVE_REQUEST_AGE.set(0)
 
+    def _activate_model(self, model: str) -> None:
+        """Count active requests per model so concurrency>1 stays accurate."""
+        count = self._model_active.get(model, 0) + 1
+        self._model_active[model] = count
+        ACTIVE_MODEL.labels(model=model).set(count)
+
+    def _deactivate_model(self, model: str) -> None:
+        count = max(0, self._model_active.get(model, 0) - 1)
+        if count:
+            self._model_active[model] = count
+        else:
+            self._model_active.pop(model, None)
+        ACTIVE_MODEL.labels(model=model).set(count)
+
     @property
     def stale_request_seconds(self) -> float:
         """Age after which an active slot must belong to an abandoned request.
 
         Chat, stream and embedding calls are all bounded by wait_for timeouts,
-        so a slot held for 1.5x the longest of those timeouts can only be a
-        leaked stream whose cleanup never ran.
+        so a slot held shortly beyond the longest of those timeouts can only be
+        a leaked stream whose cleanup never ran. Reclaim quickly enough that a
+        single abandoned stream cannot stall the only configured slot for
+        minutes.
         """
-        return 1.5 * max(settings.chat_timeout_seconds, settings.stream_timeout_seconds)
+        return 1.1 * max(settings.chat_timeout_seconds, settings.stream_timeout_seconds)
 
     def sweep_stale(self) -> list[str]:
         """Reclaim slots held by abandoned requests (GW-15).
@@ -206,7 +411,16 @@ class Scheduler:
             ACTIVE_REQUESTS.dec()
             STALE_REQUESTS.inc()
             swept.append(request_id)
+            lease = self._leases.pop(request_id, None)
+            if lease is not None:
+                # The sweep already released the slot and model gauge. Marking
+                # the lease released prevents a late cleanup from decrementing
+                # another live request's gauge; cancelling the driving task
+                # also stops the abandoned backend generation.
+                lease.released = True
+                lease.cancel()
             if not any(other["model"] == model for other in self._active.values()):
+                self._model_active.pop(model, None)
                 ACTIVE_MODEL.labels(model=model).set(0)
         if self._active:
             oldest = min(item["started_monotonic"] for item in self._active.values())
@@ -223,7 +437,7 @@ class Scheduler:
 
     async def _sweep_loop(self) -> None:
         while True:
-            await asyncio.sleep(max(1.0, self.stale_request_seconds / 3.0))
+            await asyncio.sleep(min(30.0, max(5.0, self.stale_request_seconds / 10.0)))
             self.sweep_stale()
 
     def _backend_failure(self, exc: InferenceError) -> None:
@@ -279,6 +493,13 @@ class Scheduler:
     async def embeddings(
         self, model: str, inputs: list[str], request_id: str | None = None
     ) -> list[list[float]]:
+        if self.backend.name == "llama.cpp" and not settings.llamacpp_embeddings:
+            raise InferenceError(
+                "CAPABILITY_UNSUPPORTED",
+                "The configured llama.cpp runtime does not enable embeddings",
+                False,
+                400,
+            )
         model_manager.validate(model)
         if model != settings.embedding_model:
             raise InferenceError(
@@ -305,14 +526,21 @@ class Scheduler:
                 acquired = True
                 self._dequeue()
                 queued = False
-                warm = await self._prepare(model, chat=False)
+                try:
+                    warm = await self._prepare(model, chat=False)
+                except InferenceError as exc:
+                    # ensure_available fails before the backend call; a
+                    # half-open trial started here never produced a verdict
+                    # (GW-15).
+                    self._backend_failure(exc)
+                    raise
                 try:
                     admit_request()
                 except InferenceError:
                     RESOURCE_REJECTIONS.inc()
                     raise
                 model_manager.activate(model, warm)
-                ACTIVE_MODEL.labels(model=model).set(1)
+                self._activate_model(model)
                 try:
                     vectors = await asyncio.wait_for(
                         self.backend.embeddings(model, inputs),
@@ -339,6 +567,7 @@ class Scheduler:
                     raise error from exc
                 except asyncio.CancelledError:
                     CANCELLED_REQUESTS.labels(kind="embedding").inc()
+                    self.circuit.abandon_trial()
                     raise
                 except Exception as exc:
                     error = InferenceError("INFERENCE_ERROR", str(exc), True, 503)
@@ -346,10 +575,11 @@ class Scheduler:
                     REQUESTS.labels(model=model, status="error").inc()
                     raise error from exc
                 finally:
-                    ACTIVE_MODEL.labels(model=model).set(0)
+                    self._deactivate_model(model)
             except asyncio.CancelledError:
                 if not acquired:
                     CANCELLED_REQUESTS.labels(kind="queued").inc()
+                self.circuit.abandon_trial()
                 raise
         finally:
             if acquired:
@@ -360,7 +590,9 @@ class Scheduler:
     async def chat(self, payload: dict[str, Any], request_id: str | None = None) -> dict[str, Any]:
         model = str(payload.get("model") or settings.default_model)
         model_manager.validate_chat(model)
-        _check_context_window(payload)
+        payload = await _admit_context_window(payload, self.backend)
+        payload = dict(payload)
+        payload.setdefault("max_tokens", settings.max_output_tokens)
         request_id = request_id or self._new_request_id()
         self._enqueue()
         enqueued = time.perf_counter()
@@ -372,14 +604,21 @@ class Scheduler:
                 acquired = True
                 self._dequeue()
                 queued = False
-                warm = await self._prepare(model)
+                try:
+                    warm = await self._prepare(model)
+                except InferenceError as exc:
+                    # ensure_available fails before the backend call; a
+                    # half-open trial started here never produced a verdict
+                    # (GW-15).
+                    self._backend_failure(exc)
+                    raise
                 try:
                     admit_request()
                 except InferenceError:
                     RESOURCE_REJECTIONS.inc()
                     raise
                 model_manager.activate(model, warm)
-                ACTIVE_MODEL.labels(model=model).set(1)
+                self._activate_model(model)
                 try:
                     result = await asyncio.wait_for(
                         self.backend.chat(model, payload),
@@ -398,6 +637,7 @@ class Scheduler:
                     return result
                 except asyncio.CancelledError:
                     CANCELLED_REQUESTS.labels(kind="chat").inc()
+                    self.circuit.abandon_trial()
                     raise
                 except InferenceError as exc:
                     self._backend_failure(exc)
@@ -419,10 +659,11 @@ class Scheduler:
                     REQUESTS.labels(model=model, status="error").inc()
                     raise error from exc
                 finally:
-                    ACTIVE_MODEL.labels(model=model).set(0)
+                    self._deactivate_model(model)
             except asyncio.CancelledError:
                 if not acquired:
                     CANCELLED_REQUESTS.labels(kind="queued").inc()
+                self.circuit.abandon_trial()
                 raise
         finally:
             if acquired:
@@ -436,7 +677,9 @@ class Scheduler:
         """Admit a stream before HTTP headers are committed by StreamingResponse."""
         model = str(payload.get("model") or settings.default_model)
         model_manager.validate_chat(model)
-        _check_context_window(payload)
+        payload = await _admit_context_window(payload, self.backend)
+        payload = dict(payload)
+        payload.setdefault("max_tokens", settings.max_output_tokens)
         request_id = request_id or self._new_request_id()
         self._enqueue()
         enqueued = time.perf_counter()
@@ -448,20 +691,28 @@ class Scheduler:
             acquired = True
             self._dequeue()
             queued = False
-            warm = await self._prepare(model)
+            try:
+                warm = await self._prepare(model)
+            except InferenceError as exc:
+                # ensure_available fails before the backend call; a half-open
+                # trial started here never produced a verdict (GW-15).
+                self._backend_failure(exc)
+                raise
             try:
                 admit_request()
             except InferenceError:
                 RESOURCE_REJECTIONS.inc()
                 raise
             model_manager.activate(model, warm)
-            ACTIVE_MODEL.labels(model=model).set(1)
-            lease = StreamLease(model=model, request_id=request_id)
+            self._activate_model(model)
+            lease = StreamLease(model=model, request_id=request_id, payload=payload)
+            self._leases[request_id] = lease
             lease_created = True
             return lease
         except asyncio.CancelledError:
             if not acquired:
                 CANCELLED_REQUESTS.labels(kind="queued").inc()
+            self.circuit.abandon_trial()
             raise
         finally:
             # Preparation failures must not leak the semaphore or queue token.
@@ -475,7 +726,8 @@ class Scheduler:
         if lease.released:
             return
         lease.released = True
-        ACTIVE_MODEL.labels(model=lease.model).set(0)
+        self._leases.pop(lease.request_id, None)
+        self._deactivate_model(lease.model)
         self._release_slot(lease.request_id, lease.model)
 
     async def stream(
@@ -487,14 +739,19 @@ class Scheduler:
     ) -> AsyncIterator[str]:
         """Return a streaming iterator, admitting the request before the first body byte."""
         prepared = lease or await self.prepare_stream(payload, request_id)
-        return self._stream_prepared(payload, prepared)
+        return self._stream_prepared(prepared.payload or payload, prepared)
 
     async def _stream_prepared(
         self, payload: dict[str, Any], lease: StreamLease
     ) -> AsyncIterator[str]:
         model = lease.model
+        payload = dict(payload)
+        payload.setdefault("max_tokens", settings.max_output_tokens)
         started: float | None = None
         first_token: float | None = None
+        # The stale sweeper cancels this task if the client abandons the
+        # stream and normal cleanup never runs.
+        lease.task = asyncio.current_task()
         try:
             started = time.perf_counter()
             saw_done = False
@@ -508,8 +765,15 @@ class Scheduler:
                         try:
                             event = json.loads(line)
                         except (TypeError, ValueError):
-                            event = {}
-                        if event.get("done"):
+                            event = None
+                        if not isinstance(event, dict):
+                            event = None
+                        if line.strip() == "[DONE]":
+                            # llama.cpp ends OpenAI-style streams with the
+                            # [DONE] sentinel instead of Ollama's done event
+                            # (GW-21).
+                            saw_done = True
+                        if event and event.get("done"):
                             saw_done = True
                             load = float(event.get("load_duration") or 0) / 1e9
                             generation = float(event.get("eval_duration") or 0) / 1e9
@@ -524,7 +788,21 @@ class Scheduler:
                                     TOKENS_PER_SECOND.labels(model=model).observe(
                                         completion / generation
                                     )
-                        yield line
+                        openai_usage = event.get("usage") if event else None
+                        if isinstance(openai_usage, dict) and openai_usage:
+                            # OpenAI-style usage chunk (llama.cpp with
+                            # stream_options.include_usage); it always
+                            # immediately precedes [DONE].
+                            saw_done = True
+                            prompt = int(openai_usage.get("prompt_tokens") or 0)
+                            completion = int(openai_usage.get("completion_tokens") or 0)
+                            if prompt:
+                                TOKENS.labels(model=model, kind="prompt").inc(prompt)
+                            if completion:
+                                TOKENS.labels(model=model, kind="completion").inc(completion)
+                        # Pass the already-decoded event to the API layer so a
+                        # per-token SSE line is never parsed twice.
+                        yield StreamLine(line, event)
                 if not saw_done:
                     # A backend stream that ends without its terminal event is
                     # an incomplete generation, not a success (GW-20).
@@ -540,6 +818,7 @@ class Scheduler:
                 REQUESTS.labels(model=model, status="success").inc()
             except asyncio.CancelledError:
                 CANCELLED_REQUESTS.labels(kind="stream").inc()
+                self.circuit.abandon_trial()
                 raise
             except InferenceError as exc:
                 self._backend_failure(exc)
@@ -586,10 +865,21 @@ class Scheduler:
             "available_slots": getattr(self._semaphore, "_value", None),
             "queue_timeout_seconds": settings.queue_timeout_seconds,
             "backend": self.backend.name,
+            "runtime_maintenance": self._runtime_maintenance,
             "active_requests": active,
             "circuit": self.circuit.status(),
             **model_manager.status(),
         }
+
+    def begin_runtime_maintenance(self) -> bool:
+        """Block new admissions and reserve lifecycle operations when idle."""
+        if self._runtime_maintenance or self._active or not self._queue.empty():
+            return False
+        self._runtime_maintenance = True
+        return True
+
+    def end_runtime_maintenance(self) -> None:
+        self._runtime_maintenance = False
 
     async def readiness(self) -> dict[str, Any]:
         backend_ok = await self.backend.health()
@@ -599,7 +889,9 @@ class Scheduler:
         if not refreshed:
             return {"ready": False, "reason": "model_state_unavailable"}
         state = model_manager.status()
-        configured = set(settings.inference_models)
+        configured = set(settings.models)
+        if self.backend.name == "ollama" or settings.llamacpp_embeddings:
+            configured.add(settings.embedding_model)
         available = set(state["available_models"])
         missing = sorted(configured - available)
         if missing:

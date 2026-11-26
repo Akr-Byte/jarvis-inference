@@ -6,17 +6,18 @@ Recommended CPU-only profile:
 
 - 4 vCPU
 - 10-12 GiB RAM
-- Ollama: 2.75 CPU / 9 GiB RAM
-- Gateway: 0.50 CPU / 512 MiB RAM
-- SSD-backed Ollama volume
+- llama-server: `LLAMACPP_THREADS` CPU / `MEMORY_BUDGET_GB` RAM
+- Gateway: `INFERENCE_CPUS` CPU / `INFERENCE_MEMORY_LIMIT` RAM
+- SSD-backed `MODEL_DIRECTORY` mount containing the production GGUF
 - One active generation and one loaded model
 
 ## Install
 
 ```bash
-git clone https://github.com/abdullahalrifat/jarvis-inference.git
+git clone https://github.com/Akr-Byte/jarvis-inference.git
 cd jarvis-inference
 cp .env.example .env
+cp /path/to/production-model.gguf models/
 ```
 
 For cross-VM access:
@@ -27,7 +28,8 @@ INFERENCE_API_KEY=<long-random-secret>
 INFERENCE_ALLOW_INSECURE_NO_AUTH=false
 ```
 
-Restrict TCP 8080 to the private network or trusted client IPs. Never publish Ollama port 11434.
+Restrict TCP 8080 to the private network or trusted client IPs. The llama-server port 8081 is bound
+to loopback because it has no authentication; do not publish it on a public interface.
 
 Run:
 
@@ -35,14 +37,17 @@ Run:
 bash scripts/install.sh
 ```
 
-The installer validates the deployment, builds the gateway, starts Ollama, ensures configured models exist, waits for readiness, and runs smoke checks. Set a non-empty `INFERENCE_API_KEY` before deploying; the service refuses startup without one unless the explicit development-only override is enabled.
+The installer validates the deployment, checks for a mounted GGUF, builds the gateway and
+llama-server image, starts both services, waits for readiness, and runs smoke checks. Set a non-empty
+`INFERENCE_API_KEY` before deploying; the service refuses startup without one unless the explicit
+development-only override is enabled.
 
 ## Operations
 
 ```bash
 docker compose ps
 docker compose logs --tail=100 jarvis-inference
-docker compose logs --tail=100 ollama
+docker compose logs --tail=100 llama-server
 docker compose restart jarvis-inference
 curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/ready
@@ -55,7 +60,8 @@ git pull --ff-only
 bash scripts/install.sh
 ```
 
-The Ollama named volume is preserved across gateway rebuilds.
+Mounted GGUF files are preserved across image rebuilds. The standalone Ollama profile remains
+available through `docker-compose.ollama.yml`.
 
 ## Resource policy
 
@@ -63,20 +69,22 @@ The Ollama named volume is preserved across gateway rebuilds.
 | --- | ---: |
 | VM CPU | 4 vCPU |
 | VM RAM | 10-12 GiB |
-| Ollama CPU | 2.75 |
-| Ollama RAM | 9 GiB |
-| Gateway CPU | 0.50 |
-| Gateway RAM | 512 MiB |
-| Generation concurrency | 1 |
-| Queue | 8 |
+| llama-server CPU | `LLAMACPP_THREADS` (quota from Compose `cpus`) |
+| llama-server RAM | `MEMORY_BUDGET_GB` (Compose `mem_limit`) |
+| Gateway CPU | `INFERENCE_CPUS` |
+| Gateway RAM | `INFERENCE_MEMORY_LIMIT` |
+| Generation concurrency | `MAX_CONCURRENT_REQUESTS` (keep <= `LLAMACPP_PARALLEL`) |
+| Queue | `MAX_QUEUE_SIZE` |
 | Loaded models | 1 |
-| Context | 8192 |
+| Per-slot context | `MAX_CONTEXT_LENGTH` |
+| Total engine context | `MAX_CONTEXT_LENGTH * LLAMACPP_PARALLEL` |
 
 ## Model integrity
 
 `models/manifest.yaml` records production model identities and reviewed digests. Do not silently change a recorded digest.
 
-The installer pulls only the configured model names from `.env`; model digest changes should be reviewed separately before updating the manifest.
+The installer verifies that at least one GGUF is mounted but never replaces model files. Model
+digest changes should be reviewed separately before updating the manifest.
 
 ## Security
 
@@ -84,7 +92,8 @@ The installer pulls only the configured model names from `.env`; model digest ch
 - Remote binding is explicit.
 - Startup fails closed if `INFERENCE_API_KEY` is empty, unless `INFERENCE_ALLOW_INSECURE_NO_AUTH=true` is explicitly selected for isolated local development.
 - Remote deployments require API-key authentication.
-- Ollama is never published.
-- Gateway runs non-root, read-only and with no-new-privileges.
+- llama-server port 8081 is published on loopback only; it has no authentication.
+- The gateway is the only authenticated client entry point.
+- Both containers run with no-new-privileges; the gateway is read-only.
 - Container images are pinned by digest.
 - Keep port 8080 private and do not expose metrics publicly.

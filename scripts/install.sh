@@ -31,16 +31,38 @@ set +a
 bind_address="${INFERENCE_BIND_ADDRESS:-127.0.0.1}"
 port="${INFERENCE_PORT:-8080}"
 api_key="${INFERENCE_API_KEY:-}"
-models="${OLLAMA_MODELS:-qwen3:1.7b,qwen3:4b,nomic-embed-text}"
+backend="${INFERENCE_BACKEND:-llamacpp}"
+
+case "${backend,,}" in
+  llamacpp|llama.cpp)
+    ;;
+  ollama)
+    fail "This installer targets the default llama.cpp stack. For Ollama, use: docker compose -f docker-compose.ollama.yml up -d ollama"
+    ;;
+  *)
+    fail "Unknown INFERENCE_BACKEND: $backend"
+    ;;
+esac
 
 if [[ "$bind_address" != "127.0.0.1" && "$bind_address" != "::1" && -z "$api_key" ]]; then
   fail "INFERENCE_API_KEY is required when the gateway is remotely reachable."
 fi
 
+model_dir="${MODEL_DIRECTORY:-$ROOT/models}"
+model_dir="${model_dir/#\~/$HOME}"
+[[ "$model_dir" == /* ]] || model_dir="$ROOT/$model_dir"
+
+# Match the engine entrypoint: GGUFs may live one level down (split-shard folders).
+mapfile -t gguf_models < <(find "$model_dir" -maxdepth 2 -name '*.gguf' -type f | LC_ALL=C sort)
+(( ${#gguf_models[@]} > 0 )) || {
+  fail "No GGUF model found in $model_dir. Copy a .gguf there or set MODEL_DIRECTORY in .env."
+}
+echo "==> Found ${#gguf_models[@]} GGUF model(s) in $model_dir"
+
 echo "==> Cleaning stale inference containers"
 # Compose uses stable container names. Remove only this application containers;
-# volumes are deliberately preserved so downloaded models survive redeployments.
-for container in jarvis-inference jarvis-ollama; do
+# the model directory is preserved.
+for container in jarvis-inference jarvis-llama-server; do
   if docker container inspect "$container" >/dev/null 2>&1; then
     echo "Removing existing container: $container"
     docker rm -f "$container" >/dev/null
@@ -50,31 +72,28 @@ done
 echo "==> Validating Compose configuration"
 docker compose -f "$COMPOSE_FILE" config --quiet
 
-echo "==> Building inference gateway"
-docker compose -f "$COMPOSE_FILE" build --pull jarvis-inference
+echo "==> Building llama-server and inference gateway"
+docker compose -f "$COMPOSE_FILE" build --pull llama-server jarvis-inference
 
 echo "==> Starting inference services"
-docker compose -f "$COMPOSE_FILE" up -d ollama jarvis-inference
+docker compose -f "$COMPOSE_FILE" up -d llama-server jarvis-inference
 
-echo "==> Waiting for Ollama"
-ollama_ready=0
-for _ in {1..60}; do
-  if docker compose -f "$COMPOSE_FILE" exec -T ollama ollama list >/dev/null 2>&1; then
-    ollama_ready=1
+echo "==> Waiting for llama-server"
+# Large GGUFs can take several minutes to load; match the Compose healthcheck
+# start_period so the installer does not fail while the engine is still loading.
+llama_ready=0
+for _ in {1..180}; do
+  if curl --fail --silent --show-error "http://127.0.0.1:8081/health" >/dev/null 2>&1; then
+    llama_ready=1
     break
   fi
   sleep 2
 done
-(( ollama_ready == 1 )) || {
+(( llama_ready == 1 )) || {
   docker compose -f "$COMPOSE_FILE" ps
-  fail "Ollama did not become ready."
+  docker compose -f "$COMPOSE_FILE" logs llama-server
+  fail "llama-server did not become ready. Check the mounted GGUF model and logs."
 }
-
-for model in ${models//,/ }; do
-  echo "==> Ensuring model: $model"
-  docker compose -f "$COMPOSE_FILE" exec -T ollama ollama pull "$model"
-  docker compose -f "$COMPOSE_FILE" exec -T ollama ollama show "$model" >/dev/null
-done
 
 echo "==> Waiting for inference readiness"
 ready=0
@@ -87,6 +106,7 @@ for _ in {1..60}; do
 done
 (( ready == 1 )) || {
   docker compose -f "$COMPOSE_FILE" ps
+  docker compose -f "$COMPOSE_FILE" logs jarvis-inference
   fail "Inference gateway did not become ready."
 }
 

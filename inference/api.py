@@ -4,10 +4,12 @@ import base64
 import hmac
 import json
 import logging
+import re
 import struct
 import time
 import uuid
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
@@ -15,7 +17,9 @@ from starlette.background import BackgroundTask
 
 from inference.config import settings
 from inference.errors import InferenceError
+from inference.llamacpp_runtime import runtime
 from inference.metrics import render
+from inference.model_registry import model_details, registry_status
 from inference.models import model_manager
 from inference.resources import status as resource_status
 from inference.scheduler import StreamLease, scheduler
@@ -24,6 +28,10 @@ from inference.schemas import ChatCompletionRequest, EmbeddingRequest, ModelInfo
 router = APIRouter()
 
 logger = logging.getLogger("jarvis.api")
+
+# Client-supplied request ids are echoed into response headers and payload id
+# fields; only bounded alphanumeric ids are accepted (GW-13).
+_SAFE_REQUEST_ID = re.compile(r"[A-Za-z0-9._:@/-]{1,128}")
 
 # Parameters tolerated by the request schema (extra="allow") but not
 # implemented by this gateway. They are rejected with an explicit
@@ -91,7 +99,16 @@ def _bearer(value: str | None) -> str | None:
 
 
 def _request_id(request: Request) -> str:
-    return request.headers.get("X-Request-ID") or f"chatcmpl-{uuid.uuid4().hex}"
+    """Echo a client-supplied X-Request-ID only when it is safe (GW-13).
+
+    The value is reused in response headers, JSON `id` fields and tool-call
+    ids, so it must be bounded and restricted to header-safe characters;
+    anything else is replaced with a generated id.
+    """
+    candidate = (request.headers.get("X-Request-ID") or "").strip()
+    if candidate and len(candidate) <= 128 and _SAFE_REQUEST_ID.fullmatch(candidate):
+        return candidate
+    return f"chatcmpl-{uuid.uuid4().hex}"
 
 
 @router.get("/health")
@@ -127,6 +144,9 @@ async def embeddings(
         vectors = await scheduler.embeddings(model, inputs, request_id=request_id)
     except InferenceError as exc:
         return _error_response(exc, request_id)
+    # Embedding backends do not report token counts; report a conservative
+    # estimate instead of a dishonest zero (GW-11).
+    estimated_tokens = max(1, (sum(len(str(item)) for item in inputs) + 2 * len(inputs)) // 3)
     return JSONResponse(
         content={
             "object": "list",
@@ -139,7 +159,11 @@ async def embeddings(
                 for index, vector in enumerate(vectors)
             ],
             "model": model,
-            "usage": {"prompt_tokens": 0, "total_tokens": 0},
+            "usage": {
+                "prompt_tokens": estimated_tokens,
+                "total_tokens": estimated_tokens,
+                "prompt_tokens_estimated": True,
+            },
         },
         headers={"X-Request-ID": request_id},
     )
@@ -164,16 +188,22 @@ async def capabilities(
     models = []
     for model in chat_models:
         models.append({"id": model, "capabilities": ["chat", "streaming"]})
-    models.append({"id": settings.embedding_model, "capabilities": ["embeddings"]})
+    embeddings_enabled = scheduler.backend.name == "ollama" or (
+        settings.llamacpp_embeddings
+        and (not settings.llamacpp_managed or runtime.capabilities()["embeddings"] is True)
+    )
+    if embeddings_enabled:
+        models.append({"id": settings.embedding_model, "capabilities": ["embeddings"]})
+    features = ["chat", "streaming", "model_catalog", "request_ids"]
+    if embeddings_enabled:
+        features.append("embeddings")
     return {
         "protocol": {"current": 1, "min_client": 1, "max_client": 1},
         "service": "jarvis-inference",
-        "features": [
-            "chat",
-            "streaming",
-            "embeddings",
-            "model_catalog",
-            "request_ids",
+        "features": features,
+        "limitations": [
+            "tool_choice is tolerated but not enforced by the backend "
+            "(only tool_choice=none is applied, by stripping the tools)"
         ],
         "models": models,
         "limits": {
@@ -192,7 +222,170 @@ async def inference_status(
     authorization: str | None = Header(default=None),
 ) -> dict[str, object]:
     _auth(_bearer(authorization))
-    return {"runtime": scheduler.status(), "resources": resource_status()}
+    return {
+        "runtime": scheduler.status(),
+        "engine_runtime": runtime.status(),
+        "model_registry": registry_status(),
+        "resources": resource_status(),
+    }
+
+
+@router.get("/v1/runtime/status")
+async def runtime_status(authorization: str | None = Header(default=None)) -> dict[str, object]:
+    _auth(_bearer(authorization))
+    return {"runtime": runtime.status(), "scheduler": scheduler.status()}
+
+
+@router.get("/v1/runtime/capabilities")
+async def runtime_capabilities(
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    _auth(_bearer(authorization))
+    return runtime.capabilities()
+
+
+@router.get("/v1/model-registry")
+async def model_registry_status(
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    _auth(_bearer(authorization))
+    return registry_status()
+
+
+@router.get("/v1/models/{model_id}")
+async def model_metadata(model_id: str, authorization: str | None = Header(default=None)) -> object:
+    _auth(_bearer(authorization))
+    details = model_details(model_id)
+    if details is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": {"code": "UNKNOWN_MODEL", "message": f"Unknown model '{model_id}'"}},
+        )
+    return details
+
+
+@router.get("/v1/models/{model_id}/status")
+async def model_runtime_status(
+    model_id: str, authorization: str | None = Header(default=None)
+) -> object:
+    _auth(_bearer(authorization))
+    details = model_details(model_id)
+    if details is None:
+        return JSONResponse(status_code=404, content={"error": {"code": "UNKNOWN_MODEL"}})
+    return {
+        key: details[key]
+        for key in ("id", "registered", "available", "loaded", "accepting_requests", "enabled")
+    }
+
+
+async def _model_lifecycle(model_id: str, load: bool) -> object:
+    details = model_details(model_id)
+    if details is None or not details["registered"]:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "code": "UNKNOWN_MODEL",
+                    "message": f"Model '{model_id}' is not registered",
+                }
+            },
+        )
+    if not settings.llamacpp_managed:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "LIFECYCLE_UNSUPPORTED",
+                    "message": "Model lifecycle control requires managed llama.cpp mode",
+                }
+            },
+        )
+    configured_ids = set(settings.llamacpp_model_map)
+    default_id = settings.llamacpp_alias or Path(settings.llamacpp_model).expanduser().stem
+    default_id = re.sub(r"-\d{5}-of-\d{5}$", "", default_id)
+    if model_id != default_id and model_id not in configured_ids:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "MODEL_PROFILE_UNAVAILABLE",
+                    "message": "This model has no configured managed runtime profile",
+                }
+            },
+        )
+    if not scheduler.begin_runtime_maintenance():
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "MODEL_BUSY",
+                    "message": "Wait for active and queued requests to finish before changing runtime state",
+                }
+            },
+        )
+    if load:
+        # Pre-flight the target profile before unloading the working model: a
+        # missing or unreadable GGUF must not cause avoidable downtime.
+        target = settings.llamacpp_model_map.get(model_id)
+        if target is None and model_id == default_id:
+            target = settings.llamacpp_model
+        target_path = Path(target).expanduser() if target else None
+        if target_path is None or not target_path.is_file():
+            scheduler.end_runtime_maintenance()
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "MODEL_FILE_MISSING",
+                        "message": (
+                            f"The configured GGUF for '{model_id}' is missing or not a file; "
+                            "the current model was left loaded"
+                        ),
+                    }
+                },
+            )
+    try:
+        if load:
+            current_id = runtime.active_model_id
+            if runtime.process and runtime.process.returncode is None and current_id != model_id:
+                await runtime.stop()
+                if current_id:
+                    model_manager.record_unloaded(current_id)
+            await runtime.start(model_id)
+            await model_manager.refresh(scheduler.backend, force=True)
+            return {"id": model_id, "loaded": True, "runtime": runtime.status()}
+        if runtime.active_model_id != model_id:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "MODEL_NOT_LOADED",
+                        "message": "The requested model is not the active runtime model",
+                    }
+                },
+            )
+        await runtime.stop()
+        model_manager.record_unloaded(model_id)
+        return {"id": model_id, "loaded": False, "runtime": runtime.status()}
+    except (RuntimeError, OSError) as exc:
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"code": "RUNTIME_LIFECYCLE_FAILED", "message": str(exc)}},
+        )
+    finally:
+        scheduler.end_runtime_maintenance()
+
+
+@router.post("/v1/models/{model_id}/load")
+async def load_model(model_id: str, authorization: str | None = Header(default=None)) -> object:
+    _auth(_bearer(authorization))
+    return await _model_lifecycle(model_id, load=True)
+
+
+@router.post("/v1/models/{model_id}/unload")
+async def unload_model(model_id: str, authorization: str | None = Header(default=None)) -> object:
+    _auth(_bearer(authorization))
+    return await _model_lifecycle(model_id, load=False)
 
 
 @router.get("/metrics", response_class=PlainTextResponse)
@@ -235,6 +428,14 @@ async def chat(
             },
             headers=_error_headers(request_id),
         )
+    # tool_choice honesty (GW-11): the backend ignores tool_choice entirely.
+    # The only enforceable value is "none", which the gateway applies itself
+    # by stripping the tools; "auto" is the backend default and other values
+    # are tolerated but NOT enforced (advertised via /v1/capabilities).
+    tool_choice = body.get("tool_choice")
+    if tool_choice == "none":
+        body.pop("tools", None)
+        body.pop("tool_choice", None)
     if payload.stream:
         try:
             lease = await scheduler.prepare_stream(body, request_id=request_id)
@@ -269,6 +470,7 @@ async def _stream(
     model = str(body["model"])
     model_manager.validate_chat(model)
     backend = scheduler.backend
+    openai_done_sent = False
     # OpenAI streaming semantics (GW-4a): when the client asks for usage via
     # stream_options.include_usage, the usage object ships in a final
     # usage-only chunk with empty choices — not inside the content chunk.
@@ -278,17 +480,21 @@ async def _stream(
         stream = await scheduler.stream(body, request_id=request_id, lease=lease)
         async for line in stream:
             if backend.name == "ollama":
-                try:
-                    data = backend.sse_data(line)
-                except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                    # A malformed backend line must not abort an otherwise
-                    # healthy stream; skip it and keep reading (GW-4a).
-                    logger.warning(
-                        "skipping malformed backend SSE line (request %s): %s",
-                        request_id,
-                        exc,
-                    )
-                    continue
+                # The scheduler already decoded this line for metering. Reuse
+                # that event instead of parsing every token twice.
+                data = getattr(line, "event", None)
+                if not isinstance(data, dict):
+                    try:
+                        data = backend.sse_data(line)
+                    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                        # A malformed backend line must not abort an otherwise
+                        # healthy stream; skip it and keep reading (GW-4a).
+                        logger.warning(
+                            "skipping malformed backend SSE line (request %s): %s",
+                            request_id,
+                            exc,
+                        )
+                        continue
                 message = data.get("message") or {}
                 delta: dict[str, object] = {"content": message.get("content", "")}
                 if message.get("role"):
@@ -365,6 +571,28 @@ async def _stream(
                     }
                     yield f"data: {json.dumps(usage_chunk)}\n\n"
             else:
+                # llama.cpp streams OpenAI-format chunks verbatim, including
+                # its own terminal `data: [DONE]` sentinel; only append the
+                # gateway sentinel when the backend did not send one (GW-21).
+                stripped = line.strip()
+                if stripped == "[DONE]":
+                    openai_done_sent = True
+                    yield f"data: {line}\n\n"
+                    continue
+                if not include_usage and '"usage"' in stripped:
+                    # The backend is always asked for a usage chunk so the
+                    # gateway can meter tokens (see LlamaCppBackend.stream).
+                    # Clients that did not set stream_options.include_usage
+                    # must not receive the usage-only chunk (OpenAI contract).
+                    # The scheduler's decoded event is reused when available.
+                    event = getattr(line, "event", None)
+                    if not isinstance(event, dict):
+                        try:
+                            event = json.loads(stripped)
+                        except (TypeError, ValueError):
+                            event = None
+                    if isinstance(event, dict) and event.get("usage") and not event.get("choices"):
+                        continue
                 yield f"data: {line}\n\n"
     except InferenceError as exc:
         # Once SSE headers are committed, communicate backend failures as an
@@ -380,4 +608,5 @@ async def _stream(
         yield f"data: {json.dumps(error_event)}\n\n"
         yield "data: [DONE]\n\n"
         return
-    yield "data: [DONE]\n\n"
+    if not openai_done_sent:
+        yield "data: [DONE]\n\n"

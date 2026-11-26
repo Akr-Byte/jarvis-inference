@@ -1,5 +1,188 @@
 # Changelog
 
+## Unreleased
+
+## 0.6.0 - 2026-11-24
+
+### Added
+
+- Optional native `llama-server` supervision with ownership/PID reporting, health gating, bounded
+  restart recovery, graceful shutdown, live log rotation, and version-probed optional flags.
+- GGUF metadata inspection, complete split-shard discovery, explicit model maps, model lifecycle
+  endpoints, runtime capabilities, context/output admission, and estimated weights-plus-KV memory
+  checks for managed local runtimes.
+- Workstation and constrained homelab environment profiles. Existing Ollama defaults remain in
+  place.
+- Qwen3-Next hybrid attention/recurrent memory estimation, component-level managed-runtime
+  admission diagnostics, tokenizer-backed llama.cpp chat context checks, and startup/shutdown race
+  protection for the owned process group.
+- Containerized `llama-server` image with the official llama.cpp release binary installed at build
+  time. No host binary or shared-library mounts are required; only `./models` is mounted read-only.
+- Deterministic GGUF selection with `LLAMA_MODEL`, model aliasing with `LLAMA_ALIAS`, and a startup
+  loop that waits for a mounted model instead of entering a restart loop.
+- Documented containerized model switching: restart `llama-server` to load a different GGUF; the
+  gateway refreshes the catalog automatically when the alias is unchanged.
+
+### Changed
+
+- Managed llama.cpp now passes the engine-parity flags that other OpenAI-compatible servers rely
+  on: `--jinja` for the model chat template (tool calls, roles, reasoning extraction), `--metrics`
+  for engine-level telemetry, plus opt-in `--mlock`, `--n-gpu-layers`, `--cache-reuse` and
+  `--reasoning-format`. Every flag is still gated on the `--help` capability probe.
+- CPU thread defaults follow the physical core count instead of a fixed `8`, avoiding SMT
+  oversubscription on small hosts.
+- `LLAMACPP_STARTUP_TIMEOUT_SECONDS` defaults to `300` so large GGUFs can finish loading.
+- Startup logs warn about configurations that degrade throughput or safety: gateway concurrency
+  above `LLAMACPP_PARALLEL`, unused llama.cpp slots, quantized KV caches without flash attention,
+  non-loopback managed binds, and `LLAMACPP_JINJA=false`.
+- Empty numeric environment values now fall back to defaults instead of raising at import time.
+- The default Compose stack now runs llama.cpp as the primary engine in a dedicated container. The
+  gateway connects over `LLAMACPP_URL` and overrides managed mode to `false`; native managed mode
+  remains available for workstation deployments.
+- The gateway image installs its pinned Python dependencies and starts through `uvicorn`, so the
+  Compose build is self-contained.
+- The installer, environment example, README and runbook now describe the llama.cpp container
+  workflow, including how to change the mounted model.
+- Release metadata (version, changelog top entry, README status line and workflow Dockerfile path) is
+  now checked by `scripts/check_release_consistency.py` in both CI and release gates. The stale PyPI
+  badge was removed and links now use the canonical `Akr-Byte` repository.
+- Tag-triggered releases are idempotent and support a manual retry, validate distributions with
+  `twine`, verify the wheel in a clean environment, attach `SHA256SUMS`, publish lowercase GHCR tags
+  including `latest`, and scan the image at `HIGH,CRITICAL` to match the security workflow.
+- `docs/releasing.md` documents the version policy, pre-release checklist, local CI-equivalent gate,
+  publication steps and post-release verification.
+- The gateway image installs the patched `zlib1g` build and drops pip/ensurepip after dependency
+  installation. This clears the `HIGH` Trivy findings from the pinned base's stale `zlib1g` and
+  from pip's vendored SBOM (stale `msgpack`, `setuptools` and `urllib3` copies that are never used
+  at runtime), without suppressing any advisory.
+- The release workflow refuses to publish a tag whose commit is not an ancestor of `origin/main`,
+  so a tag pushed from an unmerged feature branch can no longer produce a release.
+- The `llama-server` bind mount now follows `MODEL_DIRECTORY`, so GGUF files can live in the OS home
+  directory (`~/models`) or any absolute host path instead of the repository checkout. The installer
+  expands `~` the same way and all model-switching docs use the configured host directory. The
+  installer now discovers GGUFs one directory deep, matching the engine entrypoint's split-shard
+  folders. `.env.example` and the configuration table now document `LLAMA_MODEL` separately from the
+  native-mode `LLAMACPP_MODEL`, since the containerized engine needs an in-container path. Added a
+  note that client output limits must not exceed `MAX_OUTPUT_TOKENS`.
+
+### Performance
+
+- Optional speculative decoding: `LLAMACPP_DRAFT_MODEL` (draft GGUF path) now maps to the
+  llama-server `--draft-model` flag when the installed build advertises it, enabling the
+  draft-then-verify loop that is the largest CPU-only throughput lever for local serving.
+- Optional speculative-decoding sampling bounds: `LLAMACPP_DRAFT_MAX_LEN` (draft token horizon,
+  default 5) and `LLAMACPP_DRAFT_MIN_LEN` (minimum draft length before verification starts, default
+  5) map to llama-server `--draft-max-len` / `--draft-min-len` when a draft model is configured.
+- Optional speculative-decoding draft context size: `LLAMACPP_DRAFT_CTX_SIZE` (default 0 = engine
+  default) maps to `--draft-ctx-size` when a draft model is configured and the flag is supported.
+- Exact tokenizer-based context admission only runs near the context limit (>= 80% of prompt plus
+  output budget); shorter prompts skip the extra engine round-trip before generation.
+- Streaming requests always ask llama.cpp for a terminal usage chunk so completion tokens are
+  metered, and the usage-only chunk is filtered out for clients that did not request it.
+- GGUF discovery caches parsed headers by path, size and mtime and skips materialising tokenizer
+  vocabulary arrays, so `/v1/model-registry`, `/v1/models/{id}` and status endpoints no longer
+  re-parse every model on each call (a 150k-token vocabulary costs ~20 ms per scan).
+- `inference_active_model` is counted per model, so it stays correct when
+  `MAX_CONCURRENT_REQUESTS > 1`.
+- The body-limit middleware is pure ASGI: no per-request wrapper task, and streaming responses
+  keep their disconnect semantics.
+- llama.cpp HTTP connection limits scale with gateway concurrency instead of a fixed pool of two.
+- The containerized llama-server now receives the full `LLAMACPP_*` tuning set from `.env`. The
+  entrypoint capability-probes renamed flags, sizes context as
+  `MAX_CONTEXT_LENGTH * LLAMACPP_PARALLEL`, enables flash attention for quantized KV caches, and
+  supports speculative decoding on both current `--spec-draft-*` and legacy `--draft-*` builds.
+- Thread defaults are clamped by cgroup CPU quota and process affinity, avoiding SMT oversubscription
+  inside resource-limited containers.
+- Oversized multi-message chats are compacted once by dropping the oldest non-system messages and
+  the compacted payload is actually forwarded to the engine; the previous implementation discarded
+  its trimmed copy and re-estimated every suffix.
+- llama.cpp model-state refreshes reuse the `/v1/models` response instead of issuing a second
+  identical request for `loaded_models()`.
+- Stale stream slots are reclaimed at 1.1x the configured timeout with a 5-30s sweep, instead of
+  1.5x with a 150s sweep that could stall the only slot for minutes.
+- `scripts/benchmark.sh` reads `DEFAULT_MODEL` from `.env` and reports time to first token and
+  decode tokens/s in addition to total latency.
+- SSE lines are decoded once by the scheduler and the parsed event is attached to the streamed line,
+  so the API layer no longer re-parses every token to decide whether to suppress a usage chunk.
+- The containerized engine now receives explicit `--threads` / `--threads-batch` values matching its
+  Compose CPU quota, instead of inheriting host-core defaults that oversubscribe the container.
+- Model-discovery results are cached for two seconds, removing repeated `rglob` and `stat` work from
+  status and metadata endpoints while still noticing model changes.
+
+### Fixed
+
+- Managed model load pre-flights the target GGUF and returns `409 MODEL_FILE_MISSING` without
+  unloading the running model, instead of stopping the working model before discovering that the
+  new profile path is missing.
+- Gateway concurrency above `LLAMACPP_PARALLEL` is logged at startup; those requests previously
+  queued inside `llama-server` and surfaced as gateway timeouts rather than a clear `429`.
+- `llama-server` healthchecks use `CMD-SHELL`, and the entrypoint passes an explicit `--port 8080`
+  and the configured model alias, so Compose dependency gating and gateway model discovery work
+  reliably.
+- `MAX_CONTEXT_LENGTH` now defaults to the documented 16384 tokens in code and environment examples;
+  llama-server receives an explicit `--ctx-size` matching the gateway admission limit.
+- `Settings.active_backend` now reports `ollama` when no llama.cpp URL or managed child is configured
+  instead of always reporting `llama.cpp`.
+- GGUF selection is sorted and warns when multiple models are mounted; the engine port is published
+  on loopback and the engine container has CPU, memory and PID limits.
+- `LLAMACPP_CACHE_RAM_MIB` is passed to `llama-server --cache-ram` in MiB rather than bytes, matching
+  the engine's documented unit.
+- Speculative-decoding sampling flags are only forwarded when `LLAMACPP_DRAFT_MODEL` is set, so a
+  target-only engine never receives draft parameters.
+- The installer waits up to six minutes for `llama-server` health, matching the extended Compose
+  startup window for large GGUF loads.
+- Managed `--cache-ram` now receives MiB rather than bytes, matching the pinned llama.cpp build, and
+  zero is forwarded explicitly so the engine's 8192 MiB default cannot silently apply.
+- A compacted prompt that was rejected by the exact tokenizer is re-counted with the same tokenizer
+  before being accepted; a heuristic can no longer re-admit a prompt the engine rejected.
+- Stale-stream cleanup cancels the task driving the abandoned backend stream and marks the lease
+  released, preventing a late cleanup from decrementing another live request's model gauge.
+- Engine capability probing matches whole option tokens, so a longer or deprecated flag in the help
+  text can no longer be mistaken for support.
+- The benchmark's decode-rate metric excludes the first token, whose generation time is already
+  counted in time to first token.
+- Enabling `LLAMACPP_EMBEDDINGS` with an external engine now logs a warning that `--embedding` must
+  be supplied through `LLAMA_EXTRA_ARGS`; the thread-oversubscription warning is limited to managed
+  mode, where gateway affinity actually describes the engine process.
+- All three images now declare a non-root `USER`, clearing Trivy `DS-0002` in the security workflow;
+  the gateway, engine and Ollama containers were verified to start and serve as `appuser`.
+- The release workflow builds the root `Dockerfile` instead of the deleted `docker/Dockerfile`, so
+  tag-triggered image publishing works with the modular image layout.
+- Ruff no longer flags the forward reference in the discovery cache annotation, and the formatter
+  check passes across the tree.
+
+## 0.5.1
+
+### Fixed
+
+- **GW-15 wiring**: the scheduler now passes `trial_timeout` to every circuit
+  breaker and calls `abandon_trial()` when an admitted half-open trial exits
+  without a verdict (cancellation, client disconnect, or a pre-backend
+  admission failure). Previously the trial-wedge protection existed in
+  `CircuitBreaker` but was never enabled, so a half-open trial that exited
+  without reporting success/failure could reject every caller forever.
+- **GW-21 llama.cpp streaming**: OpenAI-format streams from llama.cpp end with
+  the `data: [DONE]` sentinel rather than Ollama's `done` event. The scheduler
+  now treats `[DONE]` (and an OpenAI `usage` chunk) as the terminal event
+  instead of failing every llama.cpp stream with `502 STREAM_INCOMPLETE`, and
+  token metrics are recorded from the OpenAI usage chunk. The gateway no
+  longer appends a duplicate `[DONE]` when the backend already sent one.
+- **GW-5 chunked bodies**: `POST /v1/*` requests using
+  `Transfer-Encoding: chunked` without a `content-length` are rejected with
+  `411 LENGTH_REQUIRED` instead of bypassing the request-size cap.
+- **GW-13 request ids**: client-supplied `X-Request-ID` values are only echoed
+  when they are at most 128 header-safe characters; otherwise a generated id
+  is used. The previous behavior echoed arbitrary/unbounded values into
+  response headers and payload `id` fields.
+- **GW-11 tool_choice honesty**: `tool_choice=none` is now enforced by
+  stripping the tools; other values are tolerated but explicitly advertised as
+  unenforced via `/v1/capabilities.limitations`.
+- Embeddings responses report an estimated `usage.prompt_tokens` instead of a
+  misleading zero.
+- `LlamaCppBackend.available_models()` degrades to an empty catalog on
+  transport errors instead of leaking a raw `httpx` exception through the
+  readiness path.
+
 ## 0.5.0
 
 ### Breaking / wire-contract changes

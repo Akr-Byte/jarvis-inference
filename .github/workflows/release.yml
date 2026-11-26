@@ -4,51 +4,135 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (without the v prefix); must match pyproject.toml"
+        required: true
+        type: string
+
+concurrency:
+  group: jarvis-inference-release
+  cancel-in-progress: false
 
 permissions:
-  contents: write
-  packages: write
-  id-token: write
-  attestations: write
+  contents: read
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # GHCR package names must be lowercase.
+  IMAGE_NAME: akr-byte/jarvis-inference
 
 jobs:
   release:
     runs-on: self-hosted
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.sha }}
+          fetch-depth: 0
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 
-      - name: Verify release version
+      - name: Resolve and verify release version
+        id: version
+        shell: bash
+        env:
+          GIT_TAG: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
-          python - <<'PY'
-          import pathlib, re
-          tag = "${{ github.ref_name }}".removeprefix("v")
-          text = pathlib.Path("pyproject.toml").read_text()
-          version = re.search(r'^version = "([^"]+)"$', text, re.M).group(1)
-          assert version == tag, (version, tag)
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            RELEASE_TAG="v${REQUESTED_VERSION}"
+          else
+            RELEASE_TAG="$GIT_TAG"
+          fi
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          RELEASE_TAG="$RELEASE_TAG" python - <<'PY'
+          import os, pathlib, re
+          tag = os.environ["RELEASE_TAG"]
+          text = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
+          match = re.search(r'^version = "([^"]+)"$', text, re.M)
+          assert match, "pyproject.toml has no version"
+          version = match.group(1)
+          assert re.fullmatch(r"\d+\.\d+\.\d+([abrc]\d+)?", version), version
+          assert version == tag.removeprefix("v"), (version, tag)
+          print(f"validated release {tag} at version {version}")
           PY
 
+      - name: Require tag commit to be on main
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+            echo "error: $RELEASE_TAG points at $(git rev-parse --short HEAD), which is not on main." >&2
+            echo "Merge the release commit into main before publishing." >&2
+            exit 1
+          fi
+
+      - name: Check whether release is new
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "Manual retry requested; publishing is enabled."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          elif gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; nothing will be rebuilt or republished."
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $RELEASE_TAG is new."
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Run release gates
+        if: steps.release.outputs.needed == 'true'
         run: |
           python -m pip install --upgrade pip
-          pip install -e '.[dev]'
+          pip install -e '.[dev]' twine
           python -m ruff check .
           python -m ruff format --check .
           bash -n scripts/*.sh
+          sh -n modules/llama/entrypoint.sh
+          python scripts/check_release_consistency.py
           python -m pytest -q --cov=inference --cov-fail-under=70
 
       - name: Build Python artifacts
+        if: steps.release.outputs.needed == 'true'
+        run: python -m build
+
+      - name: Validate Python artifacts
+        if: steps.release.outputs.needed == 'true'
+        run: python -m twine check dist/*.whl dist/*.tar.gz
+
+      - name: Verify wheel in a clean environment
+        if: steps.release.outputs.needed == 'true'
+        shell: bash
         run: |
-          python -m pip install --upgrade pip build
-          python -m build
+          python -m venv /tmp/jarvis-inference-release
+          /tmp/jarvis-inference-release/bin/python -m pip install dist/*.whl
+          /tmp/jarvis-inference-release/bin/python -c \
+            "import importlib.metadata as m; assert m.version('jarvis-inference') == '${{ steps.version.outputs.tag }}'.removeprefix('v')"
+          /tmp/jarvis-inference-release/bin/python -c "from inference.main import app; assert app"
+
+      - name: Create checksums
+        if: steps.release.outputs.needed == 'true'
+        run: cd dist && sha256sum *.whl *.tar.gz > SHA256SUMS
 
       - name: Generate source SBOM
+        if: steps.release.outputs.needed == 'true'
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
@@ -57,6 +141,7 @@ jobs:
           upload-release-assets: false
 
       - name: Log in to GHCR
+        if: steps.release.outputs.needed == 'true'
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -64,36 +149,41 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and publish container
+        if: steps.release.outputs.needed == 'true'
         id: image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v6
         with:
           context: .
-          file: docker/Dockerfile
+          file: Dockerfile
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.version=${{ steps.version.outputs.tag }}
 
       - name: Generate container SBOM
+        if: steps.release.outputs.needed == 'true'
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}
           format: spdx-json
           output-file: container-sbom.spdx.json
           upload-release-assets: false
 
       - name: Scan container
+        if: steps.release.outputs.needed == 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-          severity: CRITICAL
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}
+          severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
 
       - name: Attest container provenance
+        if: steps.release.outputs.needed == 'true'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # pinned release
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
@@ -101,13 +191,18 @@ jobs:
           push-to-registry: true
 
       - name: Attest source SBOM
+        if: steps.release.outputs.needed == 'true'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # pinned release
         with:
           subject-path: dist
           sbom-path: sbom.spdx.json
 
       - name: Create GitHub release
+        if: steps.release.outputs.needed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: |
-          gh release create "${{ github.ref_name }}" --title "${{ github.ref_name }}" --generate-notes dist/* sbom.spdx.json container-sbom.spdx.json
+          gh release create "$RELEASE_TAG" --target "${{ github.sha }}" \
+            --title "$RELEASE_TAG" --generate-notes \
+            dist/* sbom.spdx.json container-sbom.spdx.json
